@@ -8,11 +8,13 @@
  *    once per second. One button and two LEDs give the user local control.
  *    The host (GUI) sends back the alarm limits chosen by the user, so the
  *    alarm LED follows the same limits as the GUI (two-way alarm).
+ *    A second, FFT-based heart-rate estimate is calculated for comparison.
  *
  *  DATA FLOW (inside loop(), every 20 ms)
  *    button -> sensor -> filter -> adaptive threshold -> beat detection
  *    -> BPM -> alarm state (using the GUI's limits) -> LEDs
  *    -> one packet per second over Bluetooth
+ *    filtered signal -> 10 s buffer -> FFT once per second -> FFT BPM (USB only)
  *
  *  REQUIREMENT MAP
  *    Req 1   20 ms sampling of sensor and button ..... loop() scheduler
@@ -29,7 +31,9 @@
  *    Req 17  connect within 10 s ..................... advertising from power-up
  *    Req 18  fixed-length packet every second ........ sendPacket()
  *    Req 19  low-frequency drift ..................... baseline removal and
- *                                                      adaptive threshold in loop()
+ *                                                      adaptive threshold in loop(),
+ *                                                      plus an FFT pulse-rate estimate
+ *                                                      in fftUpdate()
  * ============================================================================
  */
 
@@ -54,6 +58,13 @@
 #define WINDOW_TICKS     100       // REQ 19: 2 s window (100 x 20 ms) for the adaptive threshold
 #define THRESHOLD_UPDATE 5         // recalculate threshold every 5 ticks = 100 ms
 #define MIN_AMPLITUDE    50        // below this peak-to-trough range = no pulse (no finger)
+
+// ---- FFT heart-rate estimate (REQ 19: Fourier-transform method) ----
+#define FFT_N            512       // FFT length, must be a power of 2: 512 x 20 ms = 10.24 s of signal
+#define FFT_UPDATE       50        // recalculate every 50 ticks = once per second
+#define SAMPLE_RATE_HZ   50.0f     // 1 / 20 ms
+#define FFT_MIN_HZ       0.7f      // search band 0.7-3.3 Hz = 42-198 BPM
+#define FFT_MAX_HZ       3.3f
 
 // ---- heart-rate timing ----
 #define MIN_PERIOD_MS    300       // ignore beats faster than 200 BPM (noise / double triggers)
@@ -122,6 +133,13 @@ unsigned long intervals[INTERVAL_COUNT];         // recent beat-to-beat interval
 uint8_t interval_index = 0, interval_count = 0;  // ring buffer write position and fill level
 float heart_rate = 0.0f;                         // latest BPM (0 = no valid reading)
 
+// ---- FFT state (REQ 19) ----
+float fft_ring[FFT_N];                           // last 512 filtered samples (ring buffer)
+uint16_t fft_index = 0, fft_seen = 0;            // write position and how many samples stored
+float fft_re[FFT_N], fft_im[FFT_N];              // working buffers: real and imaginary parts
+float fft_cos[FFT_N / 2], fft_sin[FFT_N / 2];    // twiddle factors, calculated once in setup()
+float fft_bpm = 0.0f;                            // FFT-based heart rate (0 = not available)
+
 /*
  * clearIntervals()
  * ----------------------------------------------------------------------------
@@ -187,6 +205,120 @@ void registerBeat(unsigned long now) {
 
   float median_ms = medianInterval();
   if (median_ms > 0.0f) heart_rate = 60000.0f / median_ms; // ms per beat -> beats per minute
+}
+
+/*
+ * fftInit()
+ * ----------------------------------------------------------------------------
+ * Purpose : Precalculate the sine and cosine values the FFT needs.
+ * Why     : calculating sine and cosine is slow; doing it once at start-up
+ *           means the once-per-second FFT only has to multiply and add.
+ */
+void fftInit() {
+  for (int k = 0; k < FFT_N / 2; k++) {
+    float a = -2.0f * PI * k / FFT_N;       // twiddle angle: e^(-j*2*pi*k/N)
+    fft_cos[k] = cosf(a);
+    fft_sin[k] = sinf(a);
+  }
+}
+
+/*
+ * fftRun()
+ * ----------------------------------------------------------------------------
+ * Purpose : Fast Fourier Transform, in place, on fft_re / fft_im.
+ * Method  : iterative radix-2 (Cooley-Tukey). First the samples are put in
+ *           bit-reversed order, then log2(N) = 9 passes combine pairs of
+ *           smaller transforms ("butterflies") into bigger ones.
+ * Why     : an FFT needs about N x log2(N) operations instead of N x N, so a
+ *           512-point transform is quick enough for the ESP32 to do inside the
+ *           loop. Written out by hand, so no extra library is needed.
+ */
+void fftRun() {
+  // bit-reversal reordering
+  for (int i = 1, j = 0; i < FFT_N; i++) {
+    int bit = FFT_N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      float t = fft_re[i]; fft_re[i] = fft_re[j]; fft_re[j] = t;
+      t = fft_im[i]; fft_im[i] = fft_im[j]; fft_im[j] = t;
+    }
+  }
+  // butterfly passes: block length 2, 4, 8, ... N
+  for (int len = 2; len <= FFT_N; len <<= 1) {
+    int half = len >> 1, step = FFT_N / len;
+    for (int i = 0; i < FFT_N; i += len) {
+      for (int k = 0; k < half; k++) {
+        float wr = fft_cos[k * step], wi = fft_sin[k * step];     // twiddle factor
+        int a = i + k, b = a + half;
+        float tr = fft_re[b] * wr - fft_im[b] * wi;               // twiddle x second half
+        float ti = fft_re[b] * wi + fft_im[b] * wr;
+        fft_re[b] = fft_re[a] - tr;  fft_im[b] = fft_im[a] - ti;  // difference
+        fft_re[a] += tr;             fft_im[a] += ti;             // sum
+      }
+    }
+  }
+}
+
+/*
+ * fftMag()
+ * ----------------------------------------------------------------------------
+ * Purpose : Size (magnitude) of one frequency bin: sqrt(re^2 + im^2).
+ */
+float fftMag(int k) {
+  return sqrtf(fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]);
+}
+
+/*
+ * fftUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Estimate the heart rate from the frequency spectrum of the last 10 s.
+ * Req     : 19 (a Fourier transform as a way of calculating the pulse rate)
+ * Effect  : sets fft_bpm (0 until a full 10 s window and a valid signal exist)
+ * Steps   : 1. copy the buffer in time order and remove its mean
+ *           2. apply a Hann window (fades the edges, so the sudden start and
+ *              end of the window do not smear the spectrum)
+ *           3. run the FFT
+ *           4. find the strongest bin between 0.7 and 3.3 Hz (42-198 BPM)
+ *           5. refine the peak with a parabola through its neighbours
+ *           6. convert frequency to BPM (x 60)
+ * Why     : the pulse is the dominant repeating frequency in the signal, so
+ *           it shows up as the tallest peak. The window is 10.24 s long, so
+ *           each bin is 0.098 Hz = 5.9 BPM wide; the parabola refinement
+ *           gives a much finer estimate than the bin spacing alone. The FFT
+ *           averages over 10 s, so it reacts more slowly than the beat-by-beat
+ *           threshold method, which stays the main source of BPM.
+ */
+void fftUpdate() {
+  if (fft_seen < FFT_N || !valid_signal) { fft_bpm = 0.0f; return; }   // need a full window and a real pulse
+
+  float mean = 0.0f;
+  for (int i = 0; i < FFT_N; i++) mean += fft_ring[i];
+  mean /= FFT_N;
+
+  for (int i = 0; i < FFT_N; i++) {
+    float x = fft_ring[(fft_index + i) % FFT_N] - mean;                // oldest sample first, mean removed
+    float hann = 0.5f - 0.5f * cosf(2.0f * PI * i / (FFT_N - 1));      // Hann window
+    fft_re[i] = x * hann;
+    fft_im[i] = 0.0f;                                                  // real input, no imaginary part
+  }
+
+  fftRun();
+
+  float bin_hz = SAMPLE_RATE_HZ / FFT_N;                               // frequency step between bins
+  int k_lo = (int)ceilf(FFT_MIN_HZ / bin_hz);                          // first bin inside the heart-rate band
+  int k_hi = (int)(FFT_MAX_HZ / bin_hz);                               // last bin inside the band
+  int k_pk = k_lo;
+  float m_pk = 0.0f;
+  for (int k = k_lo; k <= k_hi; k++) {                                 // strongest bin in the band
+    float m = fftMag(k);
+    if (m > m_pk) { m_pk = m; k_pk = k; }
+  }
+
+  float a = fftMag(k_pk - 1), b = m_pk, c = fftMag(k_pk + 1);          // peak and its two neighbours
+  float denom = a - 2.0f * b + c;
+  float delta = (denom != 0.0f) ? 0.5f * (a - c) / denom : 0.0f;      // parabola vertex offset (-0.5 to +0.5 bin)
+  fft_bpm = (k_pk + delta) * bin_hz * 60.0f;                           // Hz -> beats per minute
 }
 
 /*
@@ -377,7 +509,7 @@ void alarmLedUpdate() {
 /*
  * setup()
  * ----------------------------------------------------------------------------
- * Purpose : One-time start-up: configure pins, USB serial and Bluetooth.
+ * Purpose : One-time start-up: configure pins, USB serial, FFT tables and Bluetooth.
  * Req     : 15 (Bluetooth SPP started once, so the board is discoverable
  *           from power-up, which helps Req 17).
  */
@@ -389,6 +521,7 @@ void setup() {
   digitalWrite(LED_STATUS_PIN, LOW);                       // both LEDs start off
   digitalWrite(LED_ALARM_PIN, LOW);
   Serial.begin(115200);                                    // USB serial for the Serial Plotter (Req 4)
+  fftInit();                                               // precalculate the FFT's sine / cosine table
   if (!SerialBT.begin(BT_NAME)) Serial.println("Bluetooth init failed");   // REQ 15, called once only
   lastTickTime = micros();                                 // start the 20 ms scheduler
 }
@@ -408,7 +541,8 @@ void setup() {
  *   3. Sample        read the PPG sensor, store it for the packet
  *   4. Filter        low-pass + baseline removal (Req 19)
  *   5. Threshold     adaptive threshold from the last 2 s (Req 19)
- *   6. Beat detect   hysteresis crossing -> registerBeat() (Req 2)
+ *   6. Beat detect   hysteresis crossing -> registerBeat() (Req 2),
+ *                    and once per second the FFT estimate (Req 19)
  *   7. Alarm         BPM vs the GUI's limits -> alarm state -> alarm LED (Req 5)
  *   8. Output        Serial Plotter line (Req 4)
  */
@@ -447,6 +581,11 @@ void loop() {
   sample_index = (sample_index + 1) % WINDOW_TICKS;
   if (samples_seen < WINDOW_TICKS) samples_seen++;
 
+  // FFT buffer (the last 10 s of filtered samples)
+  fft_ring[fft_index] = (float)sensor_reading;
+  fft_index = (fft_index + 1) % FFT_N;
+  if (fft_seen < FFT_N) fft_seen++;
+
   // ---- 5. Adaptive threshold ----
   // REQ 19: adaptive threshold, updated every 100 ms once the window is full
   if (samples_seen == WINDOW_TICKS && ticks % THRESHOLD_UPDATE == 0) {
@@ -478,6 +617,9 @@ void loop() {
     clearIntervals();
   }
 
+  // REQ 19: FFT-based heart rate, once per second
+  if (ticks % FFT_UPDATE == 0) fftUpdate();
+
   // ---- 7. Alarm ----
   // REQ 5: alarm state from BPM, using the limits set on the GUI sliders
   if (heart_rate <= 0.0f)                    alarm_state = ALARM_NONE;    // no reading = no alarm
@@ -488,6 +630,7 @@ void loop() {
   alarmLedUpdate();
 
   // ---- 8. Output ----
-  // REQ 4: waveform + threshold (+ BPM) over USB for the Arduino Serial Plotter
-  Serial.printf("Raw:%d Threshold:%d HeartRate:%.1f\n", sensor_reading, threshold, heart_rate);
+  // REQ 4: waveform + threshold + both BPM estimates over USB for the Arduino Serial Plotter
+  Serial.printf("Raw:%d Threshold:%d HeartRate:%.1f FFT_BPM:%.1f\n",
+                sensor_reading, threshold, heart_rate, fft_bpm);
 }
