@@ -7,19 +7,18 @@ WHAT IT DOES
     the heart rate, pulse waveform, alarms and a system log in one window.
     The alarm limits set on the sliders are also sent back to the ESP32, so
     its alarm LED follows the same limits (two-way alarm).
-    The whole session is recorded, and when the window is closed
-    analysis.save_session() saves the data and a summary report.
- 
-    A second tab, "Researcher", shows extra real-time signal analysis
-    (pulse rate variability, second derivative, low-pass respiration/motion
-    trace, amplitude changes, FFT spectrum and spectrogram).
- 
+    Additional features (research.py):
+      - Researcher tab: spectrogram, HRV, pulse shape + 2nd derivative,
+        respiration, relative amplitude (live, last 60 s)
+      - Summary report on exit: data recorded with the device button is saved
+        to a CSV, then processed offline into a PDF report when the GUI closes
+
 ARCHITECTURE
     SerialReader thread --(rx queue)--> main() GUI loop
     SerialReader thread <--(tx queue)-- main() GUI loop   (alarm limits)
       - the thread does the slow, blocking Bluetooth work and reconnecting
       - the GUI loop only uses the queues and redraws, so it never freezes
- 
+
 PACKET FROM THE ESP32 (once per second, fixed length: 263 characters + newline)
     seq,bpm,s0,s1,...,s49,cmd
     e.g. 00123,078.9,1930,1931,...,1944,3
@@ -28,11 +27,11 @@ PACKET FROM THE ESP32 (once per second, fixed length: 263 characters + newline)
       s0..s49: 50 raw ADC readings, 20 ms apart
       cmd: button action since the last packet
            0 none, 1 record start, 2 record stop, 3 event marker, 4 alarm silenced
- 
+
 MESSAGE TO THE ESP32 (alarm limits)
     LIM,low,high      e.g. LIM,055,120
       sent when a slider moves, after every (re)connect and every 5 s
- 
+
 REQUIREMENT MAP
     Req 6   one window ............................ build_layout(), make_window()
     Req 7   BPM and waveform graphs ............... VIEWS, refresh_plot(), toggle button
@@ -50,24 +49,20 @@ REQUIREMENT MAP
     Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
     Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
     Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
-    Extra   summary report on exit ................ rec / events lists, save_session()
-                                                    (analysis.py)
-    Extra   Researcher tab (real-time analysis) ... compute_research(), refresh_research(),
-                                                    update_research_readouts(),
-                                                    build_research_layout(),
-                                                    make_research_figure()
- 
+    Extra   Researcher tab ........................ draw_research() (research.py)
+    Extra   Summary report on exit ................ Recorder, make_report() (research.py)
+
     pip install PySimpleGUI matplotlib pyserial numpy scipy
 (Install "pyserial", not "serial" - they are different packages.)
 ============================================================================
 """
- 
+
 import queue
 import threading
 import time
 from collections import deque
 from datetime import datetime
- 
+
 import numpy as np
 import PySimpleGUI as sg
 import matplotlib
@@ -75,47 +70,44 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import serial
-# RESEARCHER: added savgol_filter, find_peaks, spectrogram, detrend
-from scipy.signal import (butter, sosfiltfilt, savgol_filter, find_peaks,
-                          spectrogram, detrend)
- 
-from analysis import FS, save_session      # SUMMARY: sample rate and the report writer (analysis.py)
- 
+from scipy.signal import butter, sosfiltfilt
+from research import Recorder, draw_research, make_report
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
-PORT_NAME = "COM7"         # Windows: the OUTGOING Bluetooth COM port of the paired ESP32AK
+PORT_NAME = "COM3"         # Windows: the OUTGOING Bluetooth COM port of the paired ESP32AK
 BAUD_RATE = 115200         # ignored by Bluetooth SPP, kept for pyserial
 SERIAL_TIMEOUT_S = 2
- 
+
 LOW_LIMIT = 40     # alarm limits (changed live by the sliders, and sent to the ESP32)
 HIGH_LIMIT = 120
 LIMIT_RESEND_S = 5         # limits are re-sent this often, so a lost message or an ESP32 reboot heals itself
- 
+
 MIN_VALID_BPM, MAX_VALID_BPM = 20, 250   # outside this, treat as "no pulse"
- 
+
 REFRESH_INTERVAL_S = 0.2   # redraw target (Req 8 needs at least once per second)
 MAX_ALLOWED_GAP_S = 1.0    # requirement: never more than 1 s between refreshes
 STALE_AFTER_S = 2.0        # no packet for this long -> BPM shown as "--"
 SELF_TEST = True           # measure the worst refresh gap at start-up
 SELF_TEST_DURATION_S = 10
- 
+
 COMM_TIMEOUT_S = 5.0       # secs w/o a packet before the comms alarm shows (Req 14)
 Themes = sg.theme_list()
- 
+
 # Packet format (Req 18)
-PRINT_PACKETS = True       # debugging: print every received packet to the terminal (set False for the demo)
+PRINT_PACKETS = True      # print every received packet to the terminal
 SAMPLES_PER_PACKET = 50    # 1 s / 20 ms
 SAMPLE_PERIOD_S = 0.020    # time between samples inside a packet
 PKT_CHARS = 263            # fixed packet length, excluding the newline
 CMD_TEXT = {1: "Recording started", 2: "Recording stopped",
             3: "Event marker", 4: "Alarm silenced on device"}   # cmd code -> log message
- 
+
 # Connection handling (Req 16, 17)
 NO_DATA_TIMEOUT_S = 5      # silent failure: Bluetooth COM port can stay "open" after a drop
 RETRY_DELAY_S = 1          # pause between open attempts
 CONNECT_TARGET_S = 10      # comms should be established within this time
- 
+
 # --------------------------------------------------------------------------
 # Filter settings (Req 19, display only)
 # --------------------------------------------------------------------------
@@ -123,26 +115,11 @@ FILTER_ON = 1
 LOW_CUT_HZ = 0.5      # removes baseline drift below this
 HIGH_CUT_HZ = 4.0     # removes noise above this (240 BPM)
 FILTER_ORDER = 2      # higher = steeper cutoff, but more edge distortion
- 
-# --------------------------------------------------------------------------
-# NEW: Researcher tab settings
-# --------------------------------------------------------------------------
-FS_HZ = round(1.0 / SAMPLE_PERIOD_S)       # sample rate of the signal: 50 Hz
-RESEARCH_WINDOW_S = 30      # how much raw signal the researcher tab keeps
-                            #   (30 s gives ~2 br/min resolution on the FFT and ~30 beats for PRV)
-RESEARCH_MIN_S = 10         # do not analyse until at least this much data exists
-RESEARCH_INTERVAL_S = 1.0   # recompute + redraw rate (packets only arrive once per second anyway)
-SHORT_VIEW_S = 10           # pulse and 2nd-derivative plots show only the last 10 s
-RESP_LOWPASS_HZ = 0.5       # low-pass cutoff: keeps respiration (~0.1-0.5 Hz) and motion
-RESP_BAND_HZ = (0.1, 0.5)   # respiratory band searched in the spectrum (6-30 breaths/min)
-CARDIAC_BAND_HZ = (0.7, 3.5)  # cardiac band searched in the spectrum (42-210 BPM)
-SPEC_NPERSEG = int(8 * FS_HZ)               # spectrogram window: 8 s
-SPEC_NOVERLAP = SPEC_NPERSEG - int(FS_HZ)   # step between spectrogram columns: 1 s
-SPEC_MAX_HZ = 4.0           # top of the spectrogram frequency axis
-SPEC_DB_RANGE = 40          # spectrogram colour range below the peak (dB)
-IBI_MIN_S, IBI_MAX_S = 0.3, 2.0   # beat intervals outside this (30-200 BPM) are rejected
-IBI_MAX_DEV = 0.30          # also reject intervals >30% away from the median (missed/extra beat)
- 
+
+# Researcher tab (additional feature)
+RESEARCH_WINDOW_S = 60     # history used by the Researcher tab
+RESEARCH_REFRESH_S = 1.0   # Researcher tab redraw rate (heavier than the main view)
+
 # --------------------------------------------------------------------------
 # Views, buffers, alarm styles
 # --------------------------------------------------------------------------
@@ -160,19 +137,11 @@ VIEWS = {
         "window_s": 10, "ylim": (0, 4095), "color": "#1f6f8b",
     },
 }
- 
+
 # Rolling data shown on the graphs (old points are trimmed away)
 # pulse rows: (t, bpm)    waveform rows: (t, raw, threshold)
 data = {"pulse": deque(), "waveform": deque()}
- 
-# SUMMARY: the whole session, kept for the report on exit (never trimmed)
-rec = {"raw": [], "bpm": []}       # one entry per sample, every 20 ms (bpm is NaN when there is no pulse)
-events = []                        # (seconds since the start of the recording, log message)
- 
-# NEW: longer rolling buffer of raw samples just for the researcher tab, rows: (t, raw)
-# (the normal waveform buffer only keeps 10 s, which is too short for breathing / PRV)
-research_buf = deque()
- 
+
 # Colours and text for the pulse alarm panel (Req 11)
 ALARM_STYLES = {
     "idle": {"text": "ALARM: NO DATA", "bg": "#BDBDBD", "fg": "#222222"},
@@ -180,7 +149,7 @@ ALARM_STYLES = {
     "low":  {"text": "PULSE TOO LOW",  "bg": "#E53935", "fg": "#FFFFFF"},
     "high": {"text": "PULSE TOO HIGH", "bg": "#E53935", "fg": "#FFFFFF"},
 }
- 
+
 # Colours and text for the communication-loss box (Req 14)
 COMM_ALARM_STYLES = {
     "ok":   {"text": "COMMUNICATION OK\nData packets arriving.",
@@ -189,35 +158,12 @@ COMM_ALARM_STYLES = {
                      "Communication interrupted.",
              "bg": "#FF9800", "fg": "#000000"},
 }
- 
-# Colours for the REC indicator (shows when the device is recording)
+
 REC_STYLES = {
-    "off": {"text": "\u25CF  REC", "fg": "#9E9E9E"},   # grey, \u25CF is a filled circle
+    "off": {"text": "\u25CF  REC", "fg": "#9E9E9E"},   # grey, \u25CF is filled circle
     "on":  {"text": "\u25CF  REC", "fg": "#E53935"},   # red
 }
- 
-# NEW: title / x label / y label of each researcher plot
-RESEARCH_PANELS = {
-    "pulse": ("Band-pass pulse (0.5-4 Hz) with detected beats",
-              "Time (s, 0 = now)", "Amplitude (ADC counts)"),
-    "apg":   ("Second derivative (acceleration plethysmogram)",
-              "Time (s, 0 = now)", "d$^2$PPG/dt$^2$ (a.u.)"),
-    "low":   ("Low-pass < 0.5 Hz: baseline, motion, respiration",
-              "Time (s, 0 = now)", "ADC counts (mean removed)"),
-    "amp":   ("Beat-to-beat amplitude change",
-              "Time (s, 0 = now)", "% vs median amplitude"),
-    "spec":  ("Spectrum (FFT of last 30 s)",
-              "Frequency (Hz)   [1 Hz = 60 BPM]", "Magnitude (normalised)"),
-    "sgram": ("Spectrogram (8 s window, 1 s step)",
-              "Time (s, 0 = now)", "Frequency (Hz)"),
-    "ibi":   ("Inter-beat interval (tachogram)",
-              "Time (s, 0 = now)", "IBI (ms)"),
-    "poin":  ("Poincare plot (PRV)", "IBI n (ms)", "IBI n+1 (ms)"),
-}
-# NEW: grid position (row, col) of each plot in the researcher figure
-RESEARCH_POS = {"pulse": (0, 0), "apg": (0, 1), "low": (1, 0), "amp": (1, 1),
-                "spec": (2, 0), "sgram": (2, 1), "ibi": (3, 0), "poin": (3, 1)}
- 
+
 # --------------------------------------------------------------------------
 # Bluetooth serial reader (runs in its own thread)
 # --------------------------------------------------------------------------
@@ -240,7 +186,7 @@ class SerialReader(threading.Thread):
               never has to wait for Bluetooth. Only this thread touches the
               port, so reads and writes never collide.
     """
- 
+
     def __init__(self, rx_q, tx_q):
         super().__init__(daemon=True)                  # daemon: the thread stops when the program exits
         self.rx_q = rx_q                               # queue to the GUI loop
@@ -254,7 +200,7 @@ class SerialReader(threading.Thread):
         self.last_seq = None                           # last accepted sequence number
         self.limits = (LOW_LIMIT, HIGH_LIMIT)          # latest alarm limits to send to the ESP32
         self.last_limit_send = 0.0                     # when the limits were last sent
- 
+
     def _open_port(self):
         """Try to open the Bluetooth COM port. Returns the port, or None on failure."""
         p = serial.Serial()
@@ -269,7 +215,7 @@ class SerialReader(threading.Thread):
             return p
         except Exception:
             return None                                # device off or out of range: caller will retry
- 
+
     def _close_port(self):
         """Close the port safely and reset the receive state so it can be reopened."""
         try:
@@ -280,7 +226,7 @@ class SerialReader(threading.Thread):
         self.port = None
         self.buffer = b""
         self.last_seq = None           # new connection -> new sequence baseline
- 
+
     def _send_limits(self):
         """
         Send the alarm limits to the ESP32 as one short text line, e.g. LIM,055,120.
@@ -289,7 +235,7 @@ class SerialReader(threading.Thread):
         low, high = self.limits
         self.port.write(f"LIM,{low:03d},{high:03d}\n".encode("ascii"))
         self.last_limit_send = time.monotonic()
- 
+
     def _parse_packet(self, line):
         """
         Check and decode one packet line (Req 18).
@@ -311,7 +257,7 @@ class SerialReader(threading.Thread):
         except ValueError:                             # a non-numeric field means a corrupted packet
             return None
         return seq, bpm, samples, cmd
- 
+
     def _check_sequence(self, seq):
         """
         Check the sequence number (Req 18). Returns True if the packet should be used.
@@ -331,7 +277,7 @@ class SerialReader(threading.Thread):
                 f"{seq - self.last_seq - 1} packet(s) missed before #{seq}"))
         self.last_seq = seq
         return True
- 
+
     def _publish(self, bpm, samples):
         """
         Turn one packet into 50 timestamped waveform points for the GUI.
@@ -347,7 +293,7 @@ class SerialReader(threading.Thread):
         for i, v in enumerate(samples):
             t = t_end - (n - 1 - i) * SAMPLE_PERIOD_S    # spread over the last second
             self.rx_q.put(("data", t, v, thr, bpm))
- 
+
     def run(self):
         """
         Thread main loop: connect -> send limits + read packets -> detect
@@ -355,13 +301,13 @@ class SerialReader(threading.Thread):
         which is how the host "continuously tries to reconnect" (Req 16).
         """
         while not self.stop_event.is_set():
- 
+
             # no open port -> keep trying forever (Req 16, 17)
             if self.port is None or not self.port.is_open:
                 if self.attempt_start is None:
                     self.attempt_start = time.monotonic()      # start timing this connection attempt
                     self.rx_q.put(("status", "Connecting..."))
- 
+
                 self.port = self._open_port()
                 if self.port is None:                          # failed: wait, then try again
                     waited = time.monotonic() - self.attempt_start
@@ -371,7 +317,7 @@ class SerialReader(threading.Thread):
                             f"Not connected after {CONNECT_TARGET_S} s - still retrying"))
                     self.stop_event.wait(RETRY_DELAY_S)
                     continue
- 
+
                 self.last_data_time = time.monotonic()         # connected: reset all receive state
                 self.buffer = b""
                 self.last_seq = None
@@ -380,7 +326,7 @@ class SerialReader(threading.Thread):
                 elapsed = time.monotonic() - self.attempt_start
                 self.attempt_start = None
                 self.rx_q.put(("status", f"Connected in {elapsed:.1f} s"))   # evidence for Req 17
- 
+
             # send limits, then read bytes and split into packet lines
             try:
                 # Two-way alarm: pick up the newest limits from the GUI, and send them
@@ -390,13 +336,13 @@ class SerialReader(threading.Thread):
                     self.last_limit_send = 0.0                 # force a send now
                 if time.monotonic() - self.last_limit_send >= LIMIT_RESEND_S:
                     self._send_limits()
- 
+
                 n = self.port.in_waiting                       # bytes waiting to be read
                 if n > 0:
                     self.buffer += self.port.read(n)
                     *lines, self.buffer = self.buffer.split(b"\n")   # complete lines; the last piece is a partial packet kept for next time
                     for line in lines:
-                        if PRINT_PACKETS:                      # debugging aid: show what arrived
+                        if PRINT_PACKETS:
                             text = line.decode("ascii", errors="replace").strip()
                             print(f"[{len(text)} chars] {text}")
                         pkt = self._parse_packet(line)
@@ -418,15 +364,15 @@ class SerialReader(threading.Thread):
                         self.stop_event.wait(RETRY_DELAY_S)
                     else:
                         self.stop_event.wait(0.01)             # short sleep so we do not use 100% CPU
- 
+
             # hard failure (port vanished, or a write timed out)
             except (serial.SerialException, OSError):
                 self.rx_q.put(("status", "Connection lost - reconnecting"))
                 self._close_port()
                 self.stop_event.wait(RETRY_DELAY_S)
- 
+
         self._close_port()                                     # tidy up when the program exits
- 
+
 # --------------------------------------------------------------------------
 # Display helpers
 # --------------------------------------------------------------------------
@@ -439,17 +385,13 @@ def trim_buffers(now_t):
         cutoff = now_t - VIEWS[key]["window_s"]
         while buf and buf[0][0] < cutoff:
             buf.popleft()
-    # RESEARCHER: trim its 30 s buffer here too, so it cannot grow while the tab is hidden
-    cutoff = now_t - RESEARCH_WINDOW_S
-    while research_buf and research_buf[0][0] < cutoff:
-        research_buf.popleft()
- 
- 
+
+
 def filter_button_text():
     """Text for the filter on/off button."""
     return "Bandpass Filter: ON" if FILTER_ON else "Bandpass Filter: OFF"
- 
- 
+
+
 def bandpass(values, fs):
     """
     Purpose : Band-pass filter the waveform between 0.5 and 4 Hz.
@@ -467,8 +409,8 @@ def bandpass(values, fs):
     sos = butter(FILTER_ORDER, [LOW_CUT_HZ / nyq, HIGH_CUT_HZ / nyq],
                  btype="band", output="sos")           # Butterworth, second-order sections (numerically stable)
     return sosfiltfilt(sos, values)
- 
- 
+
+
 def refresh_plot(ax, canvas, view_key, now_t):
     """
     Purpose : Redraw the selected graph (pulse rate or waveform).
@@ -487,7 +429,7 @@ def refresh_plot(ax, canvas, view_key, now_t):
     ax.set_xlim(-view["window_s"], 0)
     ax.set_ylim(*view["ylim"])
     ax.grid(True, linestyle="--", alpha=0.4)
- 
+
     rows = list(data[view_key])
     if rows:
         xs = [r[0] - now_t for r in rows]              # time relative to now (negative = in the past)
@@ -517,13 +459,13 @@ def refresh_plot(ax, canvas, view_key, now_t):
         ax.text(0.5, 0.5, "No data yet", transform=ax.transAxes,
                 ha="center", va="center", color="grey", fontsize=14)
     canvas.draw_idle()
- 
- 
+
+
 def update_bpm(window, bpm):
     """Show the current BPM as large text with exactly 1 decimal place (Req 9, 10)."""
     window["-BPM-"].update("--" if bpm is None else f"{bpm:.1f}")
- 
- 
+
+
 def get_alarm_state(bpm):
     """
     Purpose : Classify a BPM reading against the limits.
@@ -540,323 +482,52 @@ def get_alarm_state(bpm):
     if LOW_LIMIT is None and HIGH_LIMIT is None:
         return "idle"
     return "ok"
- 
- 
+
+
 def update_alarm(window, bpm):
     """Colour and label the visual pulse alarm panel (Req 11)."""
     s = ALARM_STYLES[get_alarm_state(bpm)]
     window["-ALARM-"].update(s["text"], background_color=s["bg"], text_color=s["fg"])
- 
- 
+
+
 def update_comm_alarm(window, comm_lost):
     """Light up (or clear) the communication-loss warning box (Req 14)."""
     s = COMM_ALARM_STYLES["lost" if comm_lost else "ok"]
     window["-COMM-ALARM-"].update(s["text"], background_color=s["bg"], text_color=s["fg"])
- 
- 
+
+
 def update_rec(window, recording):
-    """Colour the REC indicator red while the device is recording, grey otherwise."""
+    """Colour the REC indicator: red while recording, grey otherwise."""
     s = REC_STYLES["on" if recording else "off"]
     window["-REC-"].update(s["text"], text_color=s["fg"])
- 
- 
+
+
 def refresh_display(window, ax, canvas, view_key, bpm, now_t):
     """Update everything the user sees: BPM number, alarm panel and graph."""
     update_bpm(window, bpm)
     update_alarm(window, bpm)
     refresh_plot(ax, canvas, view_key, now_t)
- 
- 
-# --------------------------------------------------------------------------
-# NEW: Researcher tab - signal analysis
-# --------------------------------------------------------------------------
-def compute_research(rows):
-    """
-    Purpose : Turn the last ~30 s of raw samples into every quantity shown on
-              the Researcher tab. Pure calculation, no drawing.
-    Input   : rows = list of (t, raw) samples from research_buf
-    Output  : a dict of arrays and numbers, or None if there is not yet
-              enough data (less than RESEARCH_MIN_S seconds).
-    Steps   :
-      1. Resample onto a perfectly even 50 Hz time grid. Packets arrive in
-         bursts, so the timestamps are slightly uneven; filters, derivatives
-         and FFTs all assume even spacing, so we fix that first.
-      2. Band-pass 0.5-4 Hz  -> clean pulse wave (reuses bandpass()).
-      3. Low-pass < 0.5 Hz   -> baseline wander = respiration + motion.
-      4. Second derivative   -> acceleration plethysmogram (APG). Smoothed
-         with a Savitzky-Golay filter, because a plain double difference of
-         noisy data is mostly noise.
-      5. Beat detection on the pulse wave, refined to sub-sample accuracy
-         with a parabola through the peak (20 ms sampling is coarse for PRV).
-      6. PRV metrics from the beat-to-beat intervals (IBI).
-      7. Beat-to-beat amplitude (trough to peak) as % change from the median.
-      8. FFT spectrum of the whole window + spectrogram (short-time FFT).
-    """
-    if len(rows) < RESEARCH_MIN_S * FS_HZ:
-        return None
- 
-    # ---- 1. even 50 Hz grid ----
-    arr = np.array(rows, dtype=float)
-    t, idx = np.unique(arr[:, 0], return_index=True)   # sorted, no duplicate times
-    x = arr[idx, 1]
-    tg = np.arange(t[0], t[-1], 1.0 / FS_HZ)
-    if len(tg) < RESEARCH_MIN_S * FS_HZ:
-        return None
-    xg = np.interp(tg, t, x)
-    duration = tg[-1] - tg[0]
- 
-    # ---- 2, 3, 4. filtered signals ----
-    pulse = bandpass(xg, FS_HZ)
-    sos_lp = butter(2, RESP_LOWPASS_HZ / (FS_HZ / 2), btype="low", output="sos")
-    low = sosfiltfilt(sos_lp, xg - xg.mean())
-    apg = savgol_filter(pulse, 9, 3, deriv=2, delta=1.0 / FS_HZ)   # 9 samples = 0.18 s smoothing
- 
-    # ---- 5. beats ----
-    pk, _ = find_peaks(pulse, distance=int(0.3 * FS_HZ),            # at most 200 BPM
-                       prominence=0.5 * np.std(pulse))              # ignore small ripples
-    if len(pk):
-        y0, y1, y2 = pulse[pk - 1], pulse[pk], pulse[pk + 1]
-        den = y0 - 2 * y1 + y2
-        shift = np.where(den != 0, 0.5 * (y0 - y2) / np.where(den != 0, den, 1), 0.0)
-        peak_t = tg[pk] + shift / FS_HZ            # sub-sample peak time
-    else:
-        peak_t = np.array([])
-    peak_y = pulse[pk]
- 
-    # ---- 6. PRV ----
-    ibi = np.diff(peak_t)                          # seconds between beats
-    ibi_t = peak_t[1:]                             # each IBI is stamped at its ending beat
-    valid = np.zeros(len(ibi), dtype=bool)
-    if len(ibi) >= 3:
-        med = np.median(ibi)
-        valid = (ibi > IBI_MIN_S) & (ibi < IBI_MAX_S) & (np.abs(ibi - med) < IBI_MAX_DEV * med)
-    pairs = valid[:-1] & valid[1:]                 # successive differences only between two good IBIs
-    hr = sdnn = rmssd = pnn50 = None
-    if valid.sum() >= 5:
-        good = ibi[valid]
-        hr = 60.0 / good.mean()
-        sdnn = np.std(good, ddof=1) * 1000.0                     # ms
-        d = np.diff(ibi)[pairs]
-        if len(d) >= 3:
-            rmssd = np.sqrt(np.mean(d ** 2)) * 1000.0            # ms
-            pnn50 = 100.0 * np.mean(np.abs(d) > 0.050)           # % of successive diffs > 50 ms
- 
-    # ---- 7. beat amplitude ----
-    amp_t = amp_rel = np.array([])
-    amp_cv = None
-    if len(pk) >= 3:
-        amps = np.array([pulse[pk[k]] - pulse[pk[k - 1]:pk[k]].min() for k in range(1, len(pk))])
-        if np.median(amps) > 0:
-            amp_t = peak_t[1:]
-            amp_rel = 100.0 * (amps / np.median(amps) - 1.0)     # % change from the median beat
-            amp_cv = 100.0 * np.std(amps) / np.mean(amps)
- 
-    # ---- 8. spectrum + spectrogram ----
-    nfft = 8192                                               # zero-padding: smooth curve, finer peak
-    seg = detrend(xg, type="linear") * np.hanning(len(xg))    # Hann window reduces leakage
-    mag = np.abs(np.fft.rfft(seg, n=nfft))
-    f = np.fft.rfftfreq(nfft, 1.0 / FS_HZ)
-    vis = (f >= 0.05) & (f <= 5.0)
-    mag_n = mag / mag[vis].max()
-    cb = (f >= CARDIAC_BAND_HZ[0]) & (f <= CARDIAC_BAND_HZ[1])
-    dom_hz = f[cb][np.argmax(mag[cb])]
-    resp_brpm = None
-    if duration >= 20:                                        # need >= 2 breaths for a sensible estimate
-        rb = (f >= RESP_BAND_HZ[0]) & (f <= RESP_BAND_HZ[1])
-        resp_brpm = f[rb][np.argmax(mag[rb])] * 60.0
- 
-    sg_data = None
-    if len(xg) >= SPEC_NPERSEG:
-        fs_, ts_, sxx = spectrogram(xg, fs=FS_HZ, window="hann", nperseg=SPEC_NPERSEG,
-                                    noverlap=SPEC_NOVERLAP, nfft=2048, detrend="linear",
-                                    scaling="density", mode="psd")
-        m = fs_ <= SPEC_MAX_HZ
-        sg_data = (tg[0] + ts_, fs_[m], 10 * np.log10(sxx[m] + 1e-12))   # dB
- 
-    return {
-        "tg": tg, "pulse": pulse, "low": low, "apg": apg,
-        "peak_t": peak_t, "peak_y": peak_y,
-        "ibi": ibi, "ibi_t": ibi_t, "ibi_valid": valid, "ibi_pairs": pairs,
-        "amp_t": amp_t, "amp_rel": amp_rel,
-        "f": f[vis], "mag": mag_n[vis], "dom_hz": dom_hz,
-        "sgram": sg_data,
-        "hr": hr, "sdnn": sdnn, "rmssd": rmssd, "pnn50": pnn50,
-        "dom_bpm": dom_hz * 60.0, "resp": resp_brpm, "amp_cv": amp_cv,
-        "n_beats": int(len(pk)), "duration": duration,
-    }
- 
- 
-def make_research_figure(window):
-    """
-    Purpose : Create the matplotlib figure (8 plots) inside the Researcher tab.
-    Output  : (figure, dict of axes by name, canvas)
-    Why     : a separate function from make_window(), because it is called again
-              after a theme change rebuilds the window.
-    """
-    rfig = plt.figure(figsize=(8.6, 7.2), constrained_layout=True)
-    gs = rfig.add_gridspec(4, 2)
-    axs = {name: rfig.add_subplot(gs[r, c]) for name, (r, c) in RESEARCH_POS.items()}
-    rcanvas = FigureCanvasTkAgg(rfig, master=window["-RCANVAS-"].TKCanvas)
-    rcanvas.get_tk_widget().pack(side="top", fill="both", expand=1)
-    refresh_research(axs, rcanvas, None, time.monotonic())     # draw empty titled axes
-    return rfig, axs, rcanvas
- 
- 
-def refresh_research(axs, rcanvas, res, now_t):
-    """
-    Purpose : Redraw all eight researcher plots from a compute_research() result.
-    Input   : res = result dict, or None (not enough data / signal lost)
-    Why     : x axes are "seconds before now", the same convention as the
-              Monitor tab, so the plots scroll left in step.
-    """
-    def note(ax, text):                                    # placeholder text inside an empty plot
-        ax.text(0.5, 0.5, text, transform=ax.transAxes, ha="center", va="center",
-                color="grey", fontsize=9)
- 
-    for name, ax in axs.items():                           # clear + title + labels + grid
-        title, xl, yl = RESEARCH_PANELS[name]
-        ax.clear()
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel(xl, fontsize=8)
-        ax.set_ylabel(yl, fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.grid(True, linestyle="--", alpha=0.4)
- 
-    if res is None:
-        for ax in axs.values():
-            note(ax, f"Collecting data...\n(needs {RESEARCH_MIN_S} s of signal)")
-        rcanvas.draw_idle()
-        return
- 
-    x = res["tg"] - now_t
-    short = x >= -SHORT_VIEW_S
- 
-    # 1. band-passed pulse with detected beats
-    ax = axs["pulse"]
-    ax.plot(x[short], res["pulse"][short], color="#1f6f8b")
-    pt = res["peak_t"] - now_t
-    ps = pt >= -SHORT_VIEW_S
-    ax.plot(pt[ps], res["peak_y"][ps], "v", color="#d6336c", markersize=5)
-    ax.set_xlim(-SHORT_VIEW_S, 0)
- 
-    # 2. second derivative
-    ax = axs["apg"]
-    ax.plot(x[short], res["apg"][short], color="#7b3fa0")
-    ax.axhline(0, color="grey", linewidth=0.8)
-    ax.set_xlim(-SHORT_VIEW_S, 0)
- 
-    # 3. low-pass baseline (respiration / motion)
-    ax = axs["low"]
-    ax.plot(x, res["low"], color="#2e7d32")
-    ax.axhline(0, color="grey", linewidth=0.8)
-    ax.set_xlim(-RESEARCH_WINDOW_S, 0)
- 
-    # 4. beat-to-beat amplitude change
-    ax = axs["amp"]
-    if len(res["amp_t"]):
-        ax.plot(res["amp_t"] - now_t, res["amp_rel"], "o-", color="#e8590c", markersize=3)
-        ax.axhline(0, color="grey", linewidth=0.8)
-    else:
-        note(ax, "Not enough beats")
-    ax.set_xlim(-RESEARCH_WINDOW_S, 0)
- 
-    # 5. FFT spectrum
-    ax = axs["spec"]
-    ax.axvspan(*RESP_BAND_HZ, color="#2e7d32", alpha=0.12, label="respiratory band")
-    ax.axvspan(*CARDIAC_BAND_HZ, color="#d6336c", alpha=0.08, label="cardiac band")
-    ax.plot(res["f"], res["mag"], color="#1f6f8b")
-    ax.axvline(res["dom_hz"], color="#d6336c", linestyle="--", linewidth=1,
-               label=f"peak {res['dom_bpm']:.0f} BPM")
-    ax.set_xlim(0, 5)
-    ax.legend(fontsize=6, loc="upper right")
- 
-    # 6. spectrogram
-    ax = axs["sgram"]
-    ax.grid(False)
-    if res["sgram"] is not None:
-        ts, fs_, sxx_db = res["sgram"]
-        ax.pcolormesh(ts - now_t, fs_, sxx_db, shading="auto", cmap="viridis",
-                      vmin=sxx_db.max() - SPEC_DB_RANGE, vmax=sxx_db.max())
-        ax.set_ylim(0, SPEC_MAX_HZ)
-        ax.set_xlim(-RESEARCH_WINDOW_S, 0)
-    else:
-        note(ax, "Collecting data...")
- 
-    # 7. tachogram: IBI over time (grey x = rejected interval)
-    ax = axs["ibi"]
-    if len(res["ibi"]):
-        it = res["ibi_t"] - now_t
-        v = res["ibi_valid"]
-        ax.plot(it[v], res["ibi"][v] * 1000, "o-", color="#d6336c", markersize=3)
-        ax.plot(it[~v], res["ibi"][~v] * 1000, "x", color="grey", markersize=5)
-    else:
-        note(ax, "Not enough beats")
-    ax.set_xlim(-RESEARCH_WINDOW_S, 0)
- 
-    # 8. Poincare plot: each IBI against the next one
-    ax = axs["poin"]
-    pr = res["ibi_pairs"]
-    if pr.sum() >= 3:
-        a = res["ibi"][:-1][pr] * 1000
-        b = res["ibi"][1:][pr] * 1000
-        ax.plot(a, b, "o", color="#1f6f8b", markersize=3)
-        lo, hi = min(a.min(), b.min()) - 20, max(a.max(), b.max()) + 20
-        ax.plot([lo, hi], [lo, hi], "--", color="grey", linewidth=1)   # line of identity
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
-    else:
-        note(ax, "Not enough beats")
- 
-    rcanvas.draw_idle()
- 
- 
-def update_research_readouts(window, res):
-    """
-    Purpose : Fill the numeric readouts on the right of the Researcher tab.
-    Input   : res = compute_research() result, or None -> every field shows "--"
-    """
-    def fmt(v, spec):
-        return "--" if v is None else format(v, spec)
- 
-    r = res or {}
-    window["-R-HR-"].update(fmt(r.get("hr"), ".1f"))
-    window["-R-SDNN-"].update(fmt(r.get("sdnn"), ".1f"))
-    window["-R-RMSSD-"].update(fmt(r.get("rmssd"), ".1f"))
-    window["-R-PNN50-"].update(fmt(r.get("pnn50"), ".1f"))
-    window["-R-DOM-"].update(fmt(r.get("dom_bpm"), ".1f"))
-    window["-R-RESP-"].update(fmt(r.get("resp"), ".1f"))
-    window["-R-AMPCV-"].update(fmt(r.get("amp_cv"), ".1f"))
-    window["-R-BEATS-"].update(fmt(r.get("n_beats"), "d"))
-    if res is None:
-        window["-R-STATUS-"].update("Waiting for signal...")
-    else:
-        window["-R-STATUS-"].update(f"Analysing last {res['duration']:.0f} s")
- 
- 
+
+
 def log_event(window, message):
     """
-    Purpose : Add one line to the system log, and remember it for the summary.
+    Purpose : Add one line to the system log.
     Req     : 13 (log format "<time date stamp>: <message string>")
     Example : Thu Sep 19 17:46:50 2024: Pulse Low
-    Summary : the event is also stored with its position in the recording
-              (samples recorded so far / sample rate), so the report can mark
-              where it happened on the graphs.
     """
     # Format as Day Mon DD HH:MM:SS YYYY using a 24-hour clock
     timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
- 
+
     # Combine the timestamp and event message
     log_message = f"{timestamp}: {message}"
- 
+
     # Append the event to the system log without overwriting old entries
     window["-SYSTEM-LOG-"].update(
         value=log_message + "\n",
         append=True
     )
- 
-    events.append((len(rec["raw"]) / FS, message))     # SUMMARY: seconds into the recording
- 
- 
+
+
 def log_alarm_transition(window, previous_state, current_state):
     """
     Purpose : Log pulse alarm changes, once per change.
@@ -867,20 +538,20 @@ def log_alarm_transition(window, previous_state, current_state):
     # Log entry when the pulse first enters the low state
     if current_state == "low" and previous_state != "low":
         log_event(window, "Pulse Low")
- 
+
     # Log entry when the pulse first enters the high state
     elif current_state == "high" and previous_state != "high":
         log_event(window, "Pulse High")
- 
+
     # Log recovery when a low or high pulse returns to normal
     elif current_state == "ok" and previous_state in ("low", "high"):
         log_event(window, "Pulse Normal")
- 
+
     # Log when pulse data becomes unavailable after an alarm
     elif current_state == "idle" and previous_state in ("low", "high"):
         log_event(window, "Pulse Data Unavailable")
- 
- 
+
+
 def log_comm_transition(window, previous_lost, current_lost):
     """
     Purpose : Log when communication is lost and when it returns.
@@ -893,60 +564,16 @@ def log_comm_transition(window, previous_lost, current_lost):
     # Log once when a packet arrives again and the alarm clears
     elif previous_lost and not current_lost:
         log_event(window, "Data Received - Communication Restored")
- 
- 
-# NEW: layout of the Researcher tab
-def build_research_layout():
-    """
-    Purpose : Layout of the Researcher tab: the 8-plot figure on the left and
-              numeric readouts on the right.
-    Why     : the readouts give the exact numbers that the plots only show
-              visually (PRV metrics, spectral peak, respiration estimate...).
-    """
-    def row(label, key, unit):
-        return [sg.Text(label, size=(20, 1)), sg.Text("--", key=key, size=(7, 1),
-                justification="right", font=("Any", 11, "bold")), sg.Text(unit, size=(7, 1))]
- 
-    prv = [
-        row("Mean HR (from beats)", "-R-HR-", "BPM"),
-        row("SDNN", "-R-SDNN-", "ms"),
-        row("RMSSD", "-R-RMSSD-", "ms"),
-        row("pNN50", "-R-PNN50-", "%"),
-        row("Beats detected", "-R-BEATS-", ""),
-    ]
-    spectral = [
-        row("Spectral peak", "-R-DOM-", "BPM"),
-        row("Respiration (est.)", "-R-RESP-", "br/min"),
-    ]
-    amplitude = [
-        row("Amplitude variation", "-R-AMPCV-", "% CV"),
-    ]
-    info = [[sg.Text("PRV is measured from a 50 Hz PPG (20 ms steps), so\n"
-                     "treat RMSSD / pNN50 as approximate. The window\n"
-                     "is the last 30 s; metrics need ~10 s of clean beats.",
-                     font=("Any", 8), text_color="grey")]]
- 
-    right = [
-        [sg.Frame("Pulse rate variability", prv)],
-        [sg.Frame("Frequency content", spectral)],
-        [sg.Frame("Amplitude", amplitude)],
-        [sg.Text("Waiting for signal...", key="-R-STATUS-", font=("Any", 9, "bold"))],
-        [sg.Column(info, pad=0)],
-    ]
-    return [[sg.Canvas(key="-RCANVAS-"),
-             sg.Column(right, vertical_alignment="top", pad=(10, 0))]]
- 
- 
+
+
 def build_layout():
     """
     Purpose : Define every element of the single window.
     Req     : 6 (all information in one window), 7, 9, 11, 13, 14
-    Layout  : title + theme, then a tab group.
-                Tab "Monitor"    : view / filter buttons and REC indicator above the
-                                   graph, beside the alarm panel / limit sliders / big
-                                   BPM, then the system log beside the communication
-                                   warning box (unchanged).
-                Tab "Researcher" : extra real-time signal analysis.
+    Layout  : title + theme, then two tabs (Monitor: graph beside the alarm
+              panel / limit sliders / big BPM; Researcher: 4 analysis panels),
+              then the system log beside the communication warning box, which
+              stay visible on both tabs.
     """
     idle = ALARM_STYLES["idle"]
     bpm_panel = [
@@ -967,18 +594,18 @@ def build_layout():
                  justification="center")],      # large text so it stands out at a glance (Req 9)
         [sg.Text("BPM", font=("Any", 18))],
     ]
- 
-    rec_style = REC_STYLES["off"]
+
+    rec = REC_STYLES["off"]
     plot_col = [
         [sg.Button(VIEWS["pulse"]["button_text"], key="-TOGGLE-", size=(42, 1)),
          sg.Button(filter_button_text(), key="-FILTER-", size=(18, 1)),
          sg.Push(),
-         sg.Text(rec_style["text"], key="-REC-", size=(8, 1), justification="center",
-                 font=("Any", 11, "bold"), text_color=rec_style["fg"],
+         sg.Text(rec["text"], key="-REC-", size=(8, 1), justification="center",
+                 font=("Any", 11, "bold"), text_color=rec["fg"],
                  relief=sg.RELIEF_RIDGE, border_width=2, pad=(0, 5))],
         [sg.Canvas(key="-CANVAS-")],
     ]
- 
+
     # Communication-loss warning box (sits to the right of the system log)
     comm_ok = COMM_ALARM_STYLES["ok"]
     comm_panel = [
@@ -986,13 +613,26 @@ def build_layout():
                  justification="center", font=("Any", 12, "bold"),
                  background_color=comm_ok["bg"], text_color=comm_ok["fg"])],
     ]
- 
-    # RESEARCHER: everything that used to sit directly in the window is now the "Monitor" tab
-    monitor_layout = [
-        [sg.Column(plot_col, vertical_alignment="top", pad=0),
-         sg.Column(bpm_panel, element_justification="center",
-                   vertical_alignment="center", pad=(20, 0))],
- 
+
+    return [
+        [sg.Text("Pulse Monitor", font=("Any", 20, "bold")),
+         sg.Push(),
+         sg.Text("Theme:"),
+         sg.Combo(Themes, default_value=sg.theme(), key="-THEME-",
+                  enable_events=True, readonly=True, size=(24, 1))],
+
+        # Monitor tab (main display) and Researcher tab (additional feature)
+        [sg.TabGroup([[
+            sg.Tab("Monitor", [[sg.Column(plot_col, vertical_alignment="top", pad=0),
+                                sg.Column(bpm_panel, element_justification="center",
+                                          vertical_alignment="center", pad=(20, 0))]],
+                   key="-TAB-MON-"),
+            sg.Tab("Researcher", [[sg.Canvas(key="-RCANVAS-")],
+                                  [sg.Text("Waiting for data...", key="-RSTATS-",
+                                           font=("Any", 11, "bold"))]],
+                   key="-TAB-RES-"),
+        ]], key="-TABS-", enable_events=True)],
+
         # System log heading
         [sg.Text("System Log", font=("Any", 12, "bold"))],
         # Read-only system log window at the bottom of the GUI
@@ -1007,102 +647,87 @@ def build_layout():
          sg.Column(comm_panel, element_justification="center",
                    vertical_alignment="top", pad=(20, 0))]
     ]
- 
-    return [
-        [sg.Text("Pulse Monitor", font=("Any", 20, "bold")),
-         sg.Push(),
-         sg.Text("Theme:"),
-         sg.Combo(Themes, default_value=sg.theme(), key="-THEME-",
-                  enable_events=True, readonly=True, size=(24, 1))],
-        # RESEARCHER: tab group. enable_events lets main() see tab switches;
-        # values["-TABS-"] holds the key of the visible tab.
-        [sg.TabGroup([[
-            sg.Tab("Monitor", monitor_layout, key="-TAB-MONITOR-"),
-            sg.Tab("Researcher", build_research_layout(), key="-TAB-RESEARCH-"),
-        ]], key="-TABS-", enable_events=True)],
-    ]
- 
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def make_window(log_text=""):
     """
-    Purpose : Build the window, the matplotlib figure and the canvas using the
-              current theme.
+    Purpose : Build the window and both matplotlib figures (Monitor + Researcher tab).
     Why     : a separate function, because changing the theme means rebuilding
               the whole window. log_text restores the old system log afterwards.
     """
-    # RESEARCHER: window made larger (was 1100 x 800) so the 8-plot tab fits
     window = sg.Window("Pulse Monitor", build_layout(),
-                       size=(1250, 900), resizable=True, finalize=True)
+                       size=(1100, 850), resizable=True, finalize=True)
     window["-COMM-ALARM-"].Widget.config(anchor="center")
+
+    def embed(fig, key):
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=window[key].TKCanvas)   # embed matplotlib in the window
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=1)
+        return canvas
+
     fig, ax = plt.subplots(figsize=(7, 4))
-    fig.tight_layout()
-    canvas = FigureCanvasTkAgg(fig, master=window["-CANVAS-"].TKCanvas)   # embed matplotlib in the window
-    canvas.get_tk_widget().pack(side="top", fill="both", expand=1)
+    canvas = embed(fig, "-CANVAS-")
+    rfig, raxes = plt.subplots(2, 2, figsize=(10.5, 4.6))
+    rcanvas = embed(rfig, "-RCANVAS-")
     if log_text:
         window["-SYSTEM-LOG-"].update(log_text)    # restore the old log
-    return window, fig, ax, canvas
- 
- 
+    return window, fig, ax, canvas, rfig, raxes, rcanvas
+
+
 def main():
     """
     Purpose : The GUI's main loop.
     Req     : 8 (refresh at least once per second), 12 (latency under 2 s),
               14 (5 s communication alarm), 13 (log), 11 (alarm limits)
     Steps each pass (about every 0.1 s):
-      1. Handle user events (theme, filter, view, alarm limit sliders, tabs)
-      2. Drain the queue filled by the SerialReader thread
+      1. Handle user events (theme, filter, view, tabs, alarm limit sliders)
+      2. Drain the queue filled by the SerialReader thread (and record to CSV)
       3. If 0.2 s has passed, redraw the display and check the alarms
-      4. RESEARCHER: if that tab is showing and 1 s has passed, analyse and redraw it
-    On exit : the recorded session is passed to save_session() (summary report).
+      4. If the Researcher tab is open, redraw it once per second
+    On exit : the recorded session is processed into a PDF summary report.
     Why     : redrawing is driven by a timer, not by incoming data, so the
               display still updates (and the 5 s alarm still triggers) if the
               data stops. Latency is about 1 s of packet batching plus at most
               0.2 s until the next redraw, so under the 2 s limit.
     """
     global FILTER_ON, LOW_LIMIT, HIGH_LIMIT
-    window, fig, ax, canvas = make_window()
-    rfig, raxs, rcanvas = make_research_figure(window)   # RESEARCHER: the researcher plots
- 
+    window, fig, ax, canvas, rfig, raxes, rcanvas = make_window()
+
     current_view = "pulse"                 # which graph is showing
     rx_q = queue.Queue()                   # reader thread -> GUI (packets, status, events)
     tx_q = queue.Queue()                   # GUI -> reader thread (alarm limits)
     reader = SerialReader(rx_q, tx_q)
     reader.start()                         # begin connecting in the background
- 
+
     latest_bpm = None                      # most recent valid BPM (None = no pulse)
     last_data_time = None                  # time of the newest sample
     conn_status = "Connecting..."          # last status message (so repeats are not logged)
- 
+
     # Store the previous alarm state to detect state changes
     previous_alarm_state = "idle"
- 
+
     # Record that the GUI has started
     log_event(window, "Pulse Monitor Started")
- 
+
     previous_comm_lost = False             # previous state of the 5 s communication alarm
-    recording = False                      # mirrors the ESP32's recording state (for the REC indicator)
- 
+    recording = False
+
+    research_buf = deque(maxlen=int(RESEARCH_WINDOW_S / SAMPLE_PERIOD_S))   # last 60 s of raw samples
+    recorder = Recorder()                  # writes the session CSV while recording is on
+    last_research = 0.0                    # when the Researcher tab was last redrawn
+
     start = last_refresh = time.monotonic()
     worst_gap, missed = 0.0, 0             # refresh-timing self-test results
     self_test_pending = SELF_TEST
- 
-    last_research = 0.0                    # RESEARCHER: when its tab was last redrawn
-    active_tab = "-TAB-MONITOR-"           # RESEARCHER: which tab is showing
- 
+
     while True:
         # ---- 1. user events ----
         event, values = window.read(timeout=100)     # wait up to 0.1 s for a click, then carry on
         if event == sg.WIN_CLOSED:
             break
- 
-        # RESEARCHER: remember which tab is visible; only the visible tab is redrawn
-        active_tab = values.get("-TABS-") or active_tab
-        if event == "-TABS-":
-            last_research = 0.0              # redraw the researcher tab immediately on switching
-            last_refresh = 0                 # and the monitor tab too
- 
+
         # ---- theme change: rebuild the window, keep everything else ----
         if event == "-THEME-":
             new_theme = values["-THEME-"]
@@ -1110,25 +735,22 @@ def main():
                 log_text = window["-SYSTEM-LOG-"].get().rstrip("\n") + "\n"   # save the log
                 window.close()
                 plt.close(fig)
-                plt.close(rfig)                       # RESEARCHER: close its figure too
+                plt.close(rfig)
                 sg.theme(new_theme)
-                window, fig, ax, canvas = make_window(log_text)
-                rfig, raxs, rcanvas = make_research_figure(window)   # RESEARCHER: rebuild its plots
-                if active_tab == "-TAB-RESEARCH-":    # RESEARCHER: stay on the tab the user was viewing
-                    window["-TAB-RESEARCH-"].select()
+                window, fig, ax, canvas, rfig, raxes, rcanvas = make_window(log_text)
                 window["-TOGGLE-"].update(VIEWS[current_view]["button_text"])
-                update_rec(window, recording)         # window was rebuilt, restore the REC state
+                update_rec(window, recording)         # window was rebuilt, restore REC state
                 log_event(window, f"Theme changed to {new_theme}")
                 last_refresh = 0          # redraw straight away
-                last_research = 0.0       # RESEARCHER
+                last_research = 0
                 continue
- 
+
         # Toggle bandpass filter on and off
         if event == "-FILTER-":
             FILTER_ON = 1 - FILTER_ON          # flips 1 -> 0 -> 1
             window["-FILTER-"].update(filter_button_text())
             last_refresh = 0                   # redraw immediately
- 
+
         # User moved an alarm-limit slider (Req 11)
         if event in ("-LOW-LIMIT-", "-HIGH-LIMIT-"):
             LOW_LIMIT = int(values["-LOW-LIMIT-"])
@@ -1142,14 +764,18 @@ def main():
                     window["-HIGH-LIMIT-"].update(HIGH_LIMIT)
             tx_q.put((LOW_LIMIT, HIGH_LIMIT))     # two-way alarm: pass the new limits to the ESP32
             last_refresh = 0                      # re-check the alarm straight away
- 
+
         # Switch between the pulse-rate graph and the waveform graph
         if event == "-TOGGLE-":
             current_view = "waveform" if current_view == "pulse" else "pulse"
             window["-TOGGLE-"].update(VIEWS[current_view]["button_text"])
             fig.tight_layout()
             last_refresh = 0          # redraw immediately
- 
+
+        # Switched tab: draw the Researcher tab as soon as it opens
+        if event == "-TABS-":
+            last_research = 0
+
         # ---- 2. drain everything the serial thread has received ----
         while True:
             try:
@@ -1166,88 +792,93 @@ def main():
                 if item[1] == CMD_TEXT[1]:            # record start
                     recording = True
                     update_rec(window, True)
+                    recorder.start()
                 elif item[1] == CMD_TEXT[2]:          # record stop
                     recording = False
                     update_rec(window, False)
+                    recorder.stop()
+                elif item[1] == CMD_TEXT[3]:          # event marker goes into the CSV
+                    recorder.mark("Event marker")
                 continue
             _, t, raw, thr, bpm = item                # otherwise it is a waveform sample
             last_data_time = t
-            valid_bpm = MIN_VALID_BPM <= bpm <= MAX_VALID_BPM
-            rec["raw"].append(raw)                                     # SUMMARY: keep every sample of the session
-            rec["bpm"].append(bpm if valid_bpm else float("nan"))      # NaN = no valid pulse at this moment
             data["waveform"].append((t, raw, thr))
-            research_buf.append((t, raw))                              # RESEARCHER: 30 s raw buffer
-            if valid_bpm:
+            research_buf.append(raw)                  # 60 s history for the Researcher tab
+            recorder.add(t, raw, bpm)                 # only writes while recording
+            if MIN_VALID_BPM <= bpm <= MAX_VALID_BPM:
                 latest_bpm = bpm
                 data["pulse"].append((t, bpm))
             else:
                 latest_bpm = None     # ESP32 reports 0 when no finger/pulse
- 
+
         # ---- 3. timer-driven redraw: happens whether or not data arrived ----
         now = time.monotonic()
         if now - last_refresh >= REFRESH_INTERVAL_S:
             gap = now - last_refresh if last_refresh else REFRESH_INTERVAL_S   # time since the last redraw
             stale = last_data_time is None or (now - last_data_time) > STALE_AFTER_S
             trim_buffers(now)
- 
+
             # Use the current valid BPM, or None when the data is stale
             current_bpm = None if stale else latest_bpm
- 
+
             # Determine the current alarm state
             current_alarm_state = get_alarm_state(current_bpm)
- 
+
             # Log any transition into or out of a pulse alarm state
             log_alarm_transition(window, previous_alarm_state, current_alarm_state)
             previous_alarm_state = current_alarm_state
- 
+
             # 5 s since the last packet? (Before the first packet, count from program start.)
             reference_time = last_data_time if last_data_time is not None else start
             comm_lost = (now - reference_time) > COMM_TIMEOUT_S
- 
-            # The ESP32 clears its recording flag when the link drops, so do the same here
+
+            # REC STATUS: ESP32 clears its recording flag when the link drops, so do the same here
             if comm_lost and recording:
                 recording = False
                 update_rec(window, False)
- 
+                recorder.stop()
+
             # Light up / clear the warning box
             update_comm_alarm(window, comm_lost)
- 
+
             # Write to the system log only when the state changes
             log_comm_transition(window, previous_comm_lost, comm_lost)
             previous_comm_lost = comm_lost
- 
+
             # BPM, alarm and graph updates
             refresh_display(window, ax, canvas, current_view, current_bpm, now)
             last_refresh = now
- 
+
             worst_gap = max(worst_gap, gap)           # track the slowest redraw (for the self-test)
             if gap > MAX_ALLOWED_GAP_S:
                 missed += 1
- 
-        # ---- 4. RESEARCHER: researcher tab (only while it is visible) ----
-        if active_tab == "-TAB-RESEARCH-" and now - last_research >= RESEARCH_INTERVAL_S:
-            research_stale = last_data_time is None or (now - last_data_time) > STALE_AFTER_S
-            res = None
-            if not research_stale:
-                try:
-                    res = compute_research(list(research_buf))
-                except ValueError:
-                    res = None        # e.g. a filter given too few points: show "collecting data"
-            update_research_readouts(window, res)
-            refresh_research(raxs, rcanvas, res, now)
+
+        # ---- 4. Researcher tab: once per second, only while it is showing ----
+        if values.get("-TABS-") == "-TAB-RES-" and now - last_research >= RESEARCH_REFRESH_S:
+            window["-RSTATS-"].update(draw_research(raxes, research_buf))
+            rcanvas.draw_idle()
             last_research = now
- 
+
         # One-off self-test: after 10 s, report whether any refresh took longer than 1 s (Req 8)
         if self_test_pending and now - start >= SELF_TEST_DURATION_S:
             verdict = "PASS" if worst_gap <= MAX_ALLOWED_GAP_S else "FAIL"
             print(f"SELF-TEST {verdict}: worst gap {worst_gap:.3f} s over "
                   f"{SELF_TEST_DURATION_S} s (limit {MAX_ALLOWED_GAP_S} s)")
             self_test_pending = False
- 
+
     reader.stop_event.set()                           # ask the reader thread to stop
-    save_session(rec["raw"], rec["bpm"], events, LOW_LIMIT, HIGH_LIMIT)   # SUMMARY: write the report on exit
     window.close()
- 
- 
+
+    # Summary report on exit: offline processing of the recorded session
+    csv_path = recorder.close()
+    if csv_path:
+        print(f"Session data saved: {csv_path}")
+        try:
+            pdf_path = make_report(csv_path)
+            print(f"Summary report saved: {pdf_path}" if pdf_path else "Recording too short for a report")
+        except Exception as e:
+            print(f"Report failed ({e}) - raw data is still in the CSV")
+
+
 if __name__ == "__main__":
     main()
