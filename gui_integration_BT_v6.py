@@ -68,7 +68,7 @@ from scipy.signal import butter, sosfiltfilt
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
-PORT_NAME = "COM7"         # Windows: the OUTGOING Bluetooth COM port of the paired ESP32AK
+PORT_NAME = "COM3"         # Windows: the OUTGOING Bluetooth COM port of the paired ESP32AK
 BAUD_RATE = 115200         # ignored by Bluetooth SPP, kept for pyserial
 SERIAL_TIMEOUT_S = 2
 
