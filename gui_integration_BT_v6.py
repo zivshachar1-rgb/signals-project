@@ -1,819 +1,636 @@
-"""
-============================================================================
- PULSE MONITOR GUI  -  host application (Windows, Bluetooth SPP)
-============================================================================
-WHAT IT DOES
-    Receives one packet per second from the ESP32 over Bluetooth, then shows
-    the heart rate, pulse waveform, alarms and a system log in one window.
-    The alarm limits set on the sliders are also sent back to the ESP32, so
-    its alarm LED follows the same limits (two-way alarm).
+/*
+ * ============================================================================
+ *  ESP32 WEARABLE PPG PULSE MONITOR  -  final sketch
+ * ============================================================================
+ *  WHAT IT DOES
+ *    Samples a pulse (PPG) sensor every 20 ms, detects heartbeats, calculates
+ *    heart rate (BPM) and sends the data to a host computer over Bluetooth
+ *    once per second. One button and two LEDs give the user local control.
+ *    The host (GUI) sends back the alarm limits chosen by the user, so the
+ *    alarm LED follows the same limits as the GUI (two-way alarm).
+ *    A second, FFT-based heart-rate estimate is calculated for comparison.
+ *
+ *  DATA FLOW (inside loop(), every 20 ms)
+ *    button -> sensor -> filter -> adaptive threshold -> beat detection
+ *    -> BPM -> alarm state (using the GUI's limits) -> LEDs
+ *    -> one packet per second over Bluetooth
+ *    filtered signal -> 10 s buffer -> FFT once per second -> FFT BPM (USB only)
+ *
+ *  REQUIREMENT MAP
+ *    Req 1   20 ms sampling of sensor and button ..... loop() scheduler
+ *    Req 2   BPM calculated on the microcontroller ... registerBeat(), loop()
+ *    Req 3   debounce count of 5 ..................... Switch class, DEBOUNCE_CNT
+ *    Req 4   waveform + threshold for Serial Plotter . last line of loop()
+ *    Req 5   LED and button behaviour ................ buttonUpdate(),
+ *                                                      connectionUpdate(),
+ *                                                      alarmLedUpdate(),
+ *                                                      limitsUpdate()
+ *    Req 15  Bluetooth SPP ........................... SerialBT, setup()
+ *    Req 16  reconnect ............................... ESP32 keeps advertising
+ *                                                      after a drop; the host retries
+ *    Req 17  connect within 10 s ..................... advertising from power-up
+ *    Req 18  fixed-length packet every second ........ sendPacket()
+ *    Req 19  low-frequency drift ..................... baseline removal and
+ *                                                      adaptive threshold in loop(),
+ *                                                      plus an FFT pulse-rate estimate
+ *                                                      in fftUpdate()
+ * ============================================================================
+ */
 
-ARCHITECTURE
-    SerialReader thread --(rx queue)--> main() GUI loop
-    SerialReader thread <--(tx queue)-- main() GUI loop   (alarm limits)
-      - the thread does the slow, blocking Bluetooth work and reconnecting
-      - the GUI loop only uses the queues and redraws, so it never freezes
+#include "switch.h"            // Switch class: debounces the button (Req 3)
+#include "BluetoothSerial.h"   // classic Bluetooth serial port, SPP (Req 15)
 
-PACKET FROM THE ESP32 (once per second, fixed length: 263 characters + newline)
-    seq,bpm,s0,s1,...,s49,cmd
-    e.g. 00123,078.9,1930,1931,...,1944,3
-      seq: packet sequence number (wraps at 99999)
-      bpm: pulse rate calculated on the ESP32 (0 = no valid reading)
-      s0..s49: 50 raw ADC readings, 20 ms apart
-      cmd: button action since the last packet
-           0 none, 1 record start, 2 record stop, 3 event marker, 4 alarm silenced
+// Stop compilation early if the board package has Bluetooth switched off
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled!
+#endif
 
-MESSAGE TO THE ESP32 (alarm limits)
-    LIM,low,high      e.g. LIM,055,120
-      sent when a slider moves, after every (re)connect and every 5 s
+// ---- pins ----
+#define SENSOR_PIN       25   // PPG sensor analog input
+#define BUTTON_PIN       33   // the single user button
+#define LED_STATUS_PIN   27   // connection / recording status
+#define LED_ALARM_PIN    32   // heart-rate alarm
 
-REQUIREMENT MAP
-    Req 6   one window ............................ build_layout(), make_window()
-    Req 7   BPM and waveform graphs ............... VIEWS, refresh_plot(), toggle button
-    Req 8   refresh at least once per second ...... timer-driven redraw in main()
-    Req 9   large BPM text ........................ the -BPM- element (72 pt)
-    Req 10  BPM to 1 decimal place ................ update_bpm()
-    Req 11  visual alarm for high / low pulse ..... update_alarm(); sliders set the
-                                                    limits and _send_limits() passes
-                                                    them to the ESP32
-    Req 12  display latency under 2 s ............. 1 s packets + 0.2 s redraw
-    Req 13  system log with timestamp format ...... log_event()
-    Req 14  alarm if no packet for 5 s ............ update_comm_alarm(), log_comm_transition()
-    Req 15  Bluetooth SPP ......................... SerialReader
-    Req 16  automatic reconnect ................... SerialReader.run()
-    Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
-    Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
-    Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
+#define TICK_20MSEC      20000UL   // REQ 1: 20 ms sampling period (in us) = 50 samples/s
+#define DEBOUNCE_CNT     5         // REQ 3: debounce count of 5 (button must disagree for 5 samples)
 
-    pip install PySimpleGUI matplotlib pyserial numpy scipy
-(Install "pyserial", not "serial" - they are different packages.)
-============================================================================
-"""
+// ---- signal processing ----
+#define WINDOW_TICKS     100       // REQ 19: 2 s window (100 x 20 ms) for the adaptive threshold
+#define THRESHOLD_UPDATE 5         // recalculate threshold every 5 ticks = 100 ms
+#define MIN_AMPLITUDE    50        // below this peak-to-trough range = no pulse (no finger)
 
-import queue
-import threading
-import time
-from collections import deque
-from datetime import datetime
+// ---- FFT heart-rate estimate (REQ 19: Fourier-transform method) ----
+#define FFT_N            512       // FFT length, must be a power of 2: 512 x 20 ms = 10.24 s of signal
+#define FFT_UPDATE       50        // recalculate every 50 ticks = once per second
+#define SAMPLE_RATE_HZ   50.0f     // 1 / 20 ms
+#define FFT_MIN_HZ       0.7f      // search band 0.7-3.3 Hz = 42-198 BPM
+#define FFT_MAX_HZ       3.3f
 
-import numpy as np
-import PySimpleGUI as sg
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import serial
-from scipy.signal import butter, sosfiltfilt
+// ---- heart-rate timing ----
+#define MIN_PERIOD_MS    300       // ignore beats faster than 200 BPM (noise / double triggers)
+#define MAX_PERIOD_MS    2000      // gap longer than this restarts the estimate (below 30 BPM)
+#define BEAT_TIMEOUT_MS  3000      // no beat for this long = BPM back to 0
+#define INTERVAL_COUNT   5         // number of recent beat intervals used for the median
 
-# --------------------------------------------------------------------------
-# Settings
-# --------------------------------------------------------------------------
-PORT_NAME = "COM3"         # Windows: the OUTGOING Bluetooth COM port of the paired ESP32AK
-BAUD_RATE = 115200         # ignored by Bluetooth SPP, kept for pyserial
-SERIAL_TIMEOUT_S = 2
+// ---- alarm limits: defaults used until the GUI sends its own ----
+#define DEFAULT_LOW_BPM  40
+#define DEFAULT_HIGH_BPM 120
+#define LIMIT_MIN_BPM    20        // limits outside 20-250 BPM are rejected as invalid
+#define LIMIT_MAX_BPM    250
 
-LOW_LIMIT = 40     # alarm limits (changed live by the sliders, and sent to the ESP32)
-HIGH_LIMIT = 120
-LIMIT_RESEND_S = 5         # limits are re-sent this often, so a lost message or an ESP32 reboot heals itself
+// ---- button timing ----
+#define HOLD_MS          2000UL    // press longer than this = "hold"
+#define DOUBLE_MS        500UL     // second press within this time = "double click"
 
-MIN_VALID_BPM, MAX_VALID_BPM = 20, 250   # outside this, treat as "no pulse"
+// ---- Bluetooth and packet (REQ 15, 18) ----
+#define BT_NAME          "ESP32AK"   // name the host pairs with
+#define PKT_SAMPLES      50          // 50 x 20 ms = 1 s of data per packet
 
-REFRESH_INTERVAL_S = 0.2   # redraw target (Req 8 needs at least once per second)
-MAX_ALLOWED_GAP_S = 1.0    # requirement: never more than 1 s between refreshes
-STALE_AFTER_S = 2.0        # no packet for this long -> BPM shown as "--"
-SELF_TEST = True           # measure the worst refresh gap at start-up
-SELF_TEST_DURATION_S = 10
+enum AlarmState { ALARM_NONE, ALARM_HIGH, ALARM_LOW };
+enum LinkState  { LINK_OFF, LINK_SEARCHING, LINK_CONNECTED };
 
-COMM_TIMEOUT_S = 5.0       # secs w/o a packet before the comms alarm shows (Req 14)
-Themes = sg.theme_list()
+// ---- overall system state ----
+AlarmState alarm_state = ALARM_NONE;
+LinkState  link_state = LINK_OFF;
+bool alarm_silenced = false;       // user silenced the current alarm
+bool recording = false;            // host is recording (toggled by button)
+bool bt_enabled = true;            // button hold turns host connection off / on
+int low_bpm_limit = DEFAULT_LOW_BPM;     // alarm limits, set by the GUI sliders (two-way alarm)
+int high_bpm_limit = DEFAULT_HIGH_BPM;
 
-# Packet format (Req 18)
-PRINT_PACKETS = True      # print every received packet to the terminal
-SAMPLES_PER_PACKET = 50    # 1 s / 20 ms
-SAMPLE_PERIOD_S = 0.020    # time between samples inside a packet
-PKT_CHARS = 263            # fixed packet length, excluding the newline
-CMD_TEXT = {1: "Recording started", 2: "Recording stopped",
-            3: "Event marker", 4: "Alarm silenced on device"}   # cmd code -> log message
+BluetoothSerial SerialBT;          // the Bluetooth serial port object
+Switch button(2, DEBOUNCE_CNT);    // REQ 3: debounce on the microcontroller
 
-# Connection handling (Req 16, 17)
-NO_DATA_TIMEOUT_S = 5      # silent failure: Bluetooth COM port can stay "open" after a drop
-RETRY_DELAY_S = 1          # pause between open attempts
-CONNECT_TARGET_S = 10      # comms should be established within this time
+// ---- scheduler ----
+unsigned long lastTickTime = 0;    // when the last 20 ms tick started (us)
+uint32_t ticks = 0;                // number of ticks since power-up (used for LED blink timing)
 
-# --------------------------------------------------------------------------
-# Filter settings (Req 19, display only)
-# --------------------------------------------------------------------------
-FILTER_ON = 1
-LOW_CUT_HZ = 0.5      # removes baseline drift below this
-HIGH_CUT_HZ = 4.0     # removes noise above this (240 BPM)
-FILTER_ORDER = 2      # higher = steeper cutoff, but more edge distortion
+// ---- button gesture state ----
+bool button_prev = false;          // debounced button state on the previous tick
+bool hold_handled = false;         // true once a hold was acted on (so release is not a click)
+bool pending_click = false;        // a click finished and we are waiting to see if a second follows
+bool second_press = false;         // the second press of a double click has started
+unsigned long pressed_at = 0, released_at = 0;   // timestamps of the last press / release (ms)
 
-# --------------------------------------------------------------------------
-# Views, buffers, alarm styles
-# --------------------------------------------------------------------------
-VIEWS = {
-    "pulse": {
-        "button_text": "Showing: Pulse (BPM)  -  click for Waveform",
-        "title": "Pulse Rate", "xlabel": "Time (s, 0 = now)",
-        "ylabel": "Heart rate (beats per minute)",
-        "window_s": 60, "ylim": (40, 140), "color": "#d6336c",
-    },
-    "waveform": {
-        "button_text": "Showing: Waveform (PPG)  -  click for Pulse",
-        "title": "Pulse Waveform (PPG)", "xlabel": "Time (s, 0 = now)",
-        "ylabel": "ADC reading (0-4095)",
-        "window_s": 10, "ylim": (0, 4095), "color": "#1f6f8b",
-    },
+// ---- packet state ----
+int pkt_raw[PKT_SAMPLES];          // raw ADC readings collected since the last packet
+int pkt_count = 0;                 // how many are collected so far
+unsigned long pkt_seq = 0;         // packet sequence number
+uint8_t pending_cmd = 0;           // 0 none, 1 record start, 2 record stop, 3 marker, 4 alarm silenced
+
+// ---- PPG filtering and adaptive threshold (REQ 19) ----
+float smooth = 0.0f, baseline = 0.0f;   // low-pass output and slow baseline estimate
+bool filters_ready = false;             // filters are initialised on the first sample
+int16_t samples[WINDOW_TICKS];          // rolling window of filtered samples (ring buffer)
+uint16_t sample_index = 0, samples_seen = 0;
+bool valid_signal = false;              // true when the signal is big enough to be a pulse
+bool beat_armed = true;                 // hysteresis flag: allowed to detect a new beat
+int threshold = 0, reset_threshold = 0; // upper (detect) and lower (re-arm) levels
+
+// ---- heart-rate estimation (REQ 2) ----
+unsigned long last_beat_time = 0;                // time of the previous beat (ms), 0 = none yet
+unsigned long intervals[INTERVAL_COUNT];         // recent beat-to-beat intervals (ms)
+uint8_t interval_index = 0, interval_count = 0;  // ring buffer write position and fill level
+float heart_rate = 0.0f;                         // latest BPM (0 = no valid reading)
+
+// ---- FFT state (REQ 19) ----
+float fft_ring[FFT_N];                           // last 512 filtered samples (ring buffer)
+uint16_t fft_index = 0, fft_seen = 0;            // write position and how many samples stored
+float fft_re[FFT_N], fft_im[FFT_N];              // working buffers: real and imaginary parts
+float fft_cos[FFT_N / 2], fft_sin[FFT_N / 2];    // twiddle factors, calculated once in setup()
+float fft_bpm = 0.0f;                            // FFT-based heart rate (0 = not available)
+
+/*
+ * clearIntervals()
+ * ----------------------------------------------------------------------------
+ * Purpose : Forget the recent beat intervals.
+ * Effect  : empties the interval ring buffer (the data is overwritten later).
+ * Why     : used when the pulse is lost, so an old BPM never mixes with new beats.
+ */
+void clearIntervals() {
+  interval_index = 0;
+  interval_count = 0;
 }
 
-# Rolling data shown on the graphs (old points are trimmed away)
-# pulse rows: (t, bpm)    waveform rows: (t, raw, threshold)
-data = {"pulse": deque(), "waveform": deque()}
-
-# Colours and text for the pulse alarm panel (Req 11)
-ALARM_STYLES = {
-    "idle": {"text": "ALARM: NO DATA", "bg": "#BDBDBD", "fg": "#222222"},
-    "ok":   {"text": "PULSE OK",       "bg": "#4CAF50", "fg": "#FFFFFF"},
-    "low":  {"text": "PULSE TOO LOW",  "bg": "#E53935", "fg": "#FFFFFF"},
-    "high": {"text": "PULSE TOO HIGH", "bg": "#E53935", "fg": "#FFFFFF"},
+/*
+ * medianInterval()
+ * ----------------------------------------------------------------------------
+ * Purpose : Return the median of the stored beat intervals, in ms.
+ * Input   : the intervals[] array (up to 5 values)
+ * Output  : median in ms, or 0 if no intervals yet
+ * Why     : a median ignores a single false or missed beat, whereas an average
+ *           would jump. Sorting a copy keeps the ring buffer order intact.
+ */
+float medianInterval() {
+  if (interval_count == 0) return 0.0f;
+  unsigned long sorted[INTERVAL_COUNT];
+  for (uint8_t i = 0; i < interval_count; i++) sorted[i] = intervals[i];   // copy
+  for (uint8_t i = 1; i < interval_count; i++) {          // insertion sort (tiny array)
+    unsigned long key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
+    sorted[j + 1] = key;
+  }
+  if (interval_count % 2 == 1) return sorted[interval_count / 2];                      // odd: middle value
+  return (sorted[interval_count / 2 - 1] + sorted[interval_count / 2]) / 2.0f;        // even: mean of middle two
 }
 
-# Colours and text for the communication-loss box (Req 14)
-COMM_ALARM_STYLES = {
-    "ok":   {"text": "COMMUNICATION OK\nData packets arriving.",
-             "bg": "#BDBDBD", "fg": "#222222"},
-    "lost": {"text": "\u26A0\nWARNING\nData not received for 5 secs.\n"
-                     "Communication interrupted.",
-             "bg": "#FF9800", "fg": "#000000"},
+/*
+ * registerBeat()
+ * ----------------------------------------------------------------------------
+ * Purpose : Turn one detected heartbeat into an updated heart rate.
+ * Req     : 2 (BPM calculated on the microcontroller)
+ * Input   : now = time of the beat in ms
+ * Effect  : updates heart_rate, the interval history and last_beat_time
+ * Why     : BPM = 60000 / median interval. Intervals outside 300-2000 ms are
+ *           rejected (200 BPM max, 30 BPM min) so noise cannot give nonsense.
+ */
+void registerBeat(unsigned long now) {
+  if (last_beat_time == 0) { last_beat_time = now; return; }   // first beat: just start the clock
+
+  unsigned long period = now - last_beat_time;   // time since the previous beat (ms)
+  if (period < MIN_PERIOD_MS) return;                      // too fast, ignore
+
+  if (period > MAX_PERIOD_MS) {                            // too slow, restart estimate
+    last_beat_time = now;
+    heart_rate = 0.0f;
+    clearIntervals();
+    return;
+  }
+
+  last_beat_time = now;                                    // accept this beat
+  intervals[interval_index] = period;                      // store the interval in the ring buffer
+  interval_index = (interval_index + 1) % INTERVAL_COUNT;
+  if (interval_count < INTERVAL_COUNT) interval_count++;
+
+  float median_ms = medianInterval();
+  if (median_ms > 0.0f) heart_rate = 60000.0f / median_ms; // ms per beat -> beats per minute
 }
 
-REC_STYLES = {
-    "off": {"text": "\u25CF  REC", "fg": "#9E9E9E"},   # grey, \u25CF is filled circle
-    "on":  {"text": "\u25CF  REC", "fg": "#E53935"},   # red
+/*
+ * fftInit()
+ * ----------------------------------------------------------------------------
+ * Purpose : Precalculate the sine and cosine values the FFT needs.
+ * Why     : calculating sine and cosine is slow; doing it once at start-up
+ *           means the once-per-second FFT only has to multiply and add.
+ */
+void fftInit() {
+  for (int k = 0; k < FFT_N / 2; k++) {
+    float a = -2.0f * PI * k / FFT_N;       // twiddle angle: e^(-j*2*pi*k/N)
+    fft_cos[k] = cosf(a);
+    fft_sin[k] = sinf(a);
+  }
 }
 
-# --------------------------------------------------------------------------
-# Bluetooth serial reader (runs in its own thread)
-# --------------------------------------------------------------------------
-class SerialReader(threading.Thread):
-    """
-    SerialReader
-    ------------------------------------------------------------------------
-    Purpose : Open the Bluetooth COM port, read packets, check them, and hand
-              them to the GUI. Also sends the alarm limits to the ESP32. Keeps
-              retrying if the link never comes up or is lost.
-    Req     : 15 (Bluetooth SPP), 16 (reconnect), 17 (connect within 10 s),
-              18 (packet checking, sequence numbers), 11 (limits to the ESP32)
-    Input   : tx_q holds (low, high) alarm limits from the GUI sliders
-    Output  : messages on rx_q, each one of:
-                ("status", text)                  connection information
-                ("event", text)                   button action from the device
-                ("data", t, raw, thr, bpm)        one waveform sample
-    Why     : serial reads can block for seconds, so this runs in a separate
-              thread. The queues are thread-safe, so the GUI never freezes and
-              never has to wait for Bluetooth. Only this thread touches the
-              port, so reads and writes never collide.
-    """
-
-    def __init__(self, rx_q, tx_q):
-        super().__init__(daemon=True)                  # daemon: the thread stops when the program exits
-        self.rx_q = rx_q                               # queue to the GUI loop
-        self.tx_q = tx_q                               # queue from the GUI loop (alarm limits)
-        self.stop_event = threading.Event()            # set by the GUI to stop the thread
-        self.port = None                               # the open serial port, or None
-        self.buffer = b""                              # bytes received but not yet split into packets
-        self.last_data_time = time.monotonic()         # when the last valid packet arrived
-        self.attempt_start = None                      # when the current connection attempt began
-        self.warned = False                            # so the "still retrying" message appears once
-        self.last_seq = None                           # last accepted sequence number
-        self.limits = (LOW_LIMIT, HIGH_LIMIT)          # latest alarm limits to send to the ESP32
-        self.last_limit_send = 0.0                     # when the limits were last sent
-
-    def _open_port(self):
-        """Try to open the Bluetooth COM port. Returns the port, or None on failure."""
-        p = serial.Serial()
-        p.port = PORT_NAME
-        p.baudrate = BAUD_RATE
-        p.bytesize = 8
-        p.timeout = SERIAL_TIMEOUT_S
-        p.write_timeout = SERIAL_TIMEOUT_S             # a write to a dropped link must not hang forever
-        p.stopbits = serial.STOPBITS_ONE
-        try:
-            p.open()                                   # opening the outgoing port makes Windows connect to the ESP32
-            return p
-        except Exception:
-            return None                                # device off or out of range: caller will retry
-
-    def _close_port(self):
-        """Close the port safely and reset the receive state so it can be reopened."""
-        try:
-            if self.port is not None:
-                self.port.close()
-        except Exception:
-            pass
-        self.port = None
-        self.buffer = b""
-        self.last_seq = None           # new connection -> new sequence baseline
-
-    def _send_limits(self):
-        """
-        Send the alarm limits to the ESP32 as one short text line, e.g. LIM,055,120.
-        Zero-padded to 3 digits so the ESP32 parser always sees the same shape.
-        """
-        low, high = self.limits
-        self.port.write(f"LIM,{low:03d},{high:03d}\n".encode("ascii"))
-        self.last_limit_send = time.monotonic()
-
-    def _parse_packet(self, line):
-        """
-        Check and decode one packet line (Req 18).
-        Returns (seq, bpm, samples, cmd), or None if the line is not a valid
-        packet. A valid packet is exactly 263 characters with 53 numeric
-        fields, so cut-off or corrupted lines are silently rejected.
-        """
-        text = line.decode("ascii", errors="replace").strip()
-        if len(text) != PKT_CHARS:                     # fixed length check
-            return None
-        parts = text.split(",")
-        if len(parts) != SAMPLES_PER_PACKET + 3:       # seq + bpm + 50 samples + cmd
-            return None
-        try:
-            seq = int(parts[0])
-            bpm = float(parts[1])
-            samples = [int(x) for x in parts[2:2 + SAMPLES_PER_PACKET]]
-            cmd = int(parts[-1])
-        except ValueError:                             # a non-numeric field means a corrupted packet
-            return None
-        return seq, bpm, samples, cmd
-
-    def _check_sequence(self, seq):
-        """
-        Check the sequence number (Req 18). Returns True if the packet should be used.
-          first packet / seq 0 : accept (new connection, wrap-around, ESP32 reboot)
-          seq <= last          : duplicate or out of order, so discard it
-          seq > last + 1       : packets were missed, so report it but use this one
-        """
-        if self.last_seq is None or seq == 0:
-            self.last_seq = seq        # first packet after connect, wrap-around, or ESP32 reboot
-            return True
-        if seq <= self.last_seq:
-            self.rx_q.put(("status",
-                f"Out-of-order/duplicate packet {seq} (last {self.last_seq}) - discarded"))
-            return False
-        if seq > self.last_seq + 1:
-            self.rx_q.put(("status",
-                f"{seq - self.last_seq - 1} packet(s) missed before #{seq}"))
-        self.last_seq = seq
-        return True
-
-    def _publish(self, bpm, samples):
-        """
-        Turn one packet into 50 timestamped waveform points for the GUI.
-        The packet arrives all at once, so the original 20 ms spacing is
-        rebuilt by working backwards from the arrival time. The threshold line
-        is only for display and is computed here on the host (60% of the
-        packet's range); the ESP32 uses its own threshold for the BPM.
-        """
-        t_end = time.monotonic()
-        lo, hi = min(samples), max(samples)
-        thr = lo + 0.6 * (hi - lo)     # display threshold line, computed on the host
-        n = len(samples)
-        for i, v in enumerate(samples):
-            t = t_end - (n - 1 - i) * SAMPLE_PERIOD_S    # spread over the last second
-            self.rx_q.put(("data", t, v, thr, bpm))
-
-    def run(self):
-        """
-        Thread main loop: connect -> send limits + read packets -> detect
-        failure -> reconnect. The loop never exits until the program closes,
-        which is how the host "continuously tries to reconnect" (Req 16).
-        """
-        while not self.stop_event.is_set():
-
-            # no open port -> keep trying forever (Req 16, 17)
-            if self.port is None or not self.port.is_open:
-                if self.attempt_start is None:
-                    self.attempt_start = time.monotonic()      # start timing this connection attempt
-                    self.rx_q.put(("status", "Connecting..."))
-
-                self.port = self._open_port()
-                if self.port is None:                          # failed: wait, then try again
-                    waited = time.monotonic() - self.attempt_start
-                    if waited > CONNECT_TARGET_S and not self.warned:
-                        self.warned = True                     # warn once, not every second
-                        self.rx_q.put(("status",
-                            f"Not connected after {CONNECT_TARGET_S} s - still retrying"))
-                    self.stop_event.wait(RETRY_DELAY_S)
-                    continue
-
-                self.last_data_time = time.monotonic()         # connected: reset all receive state
-                self.buffer = b""
-                self.last_seq = None
-                self.last_limit_send = 0.0                     # send the limits straight away on a new connection
-                self.warned = False
-                elapsed = time.monotonic() - self.attempt_start
-                self.attempt_start = None
-                self.rx_q.put(("status", f"Connected in {elapsed:.1f} s"))   # evidence for Req 17
-
-            # send limits, then read bytes and split into packet lines
-            try:
-                # Two-way alarm: pick up the newest limits from the GUI, and send them
-                # when they change, after connecting, and every LIMIT_RESEND_S seconds.
-                while not self.tx_q.empty():
-                    self.limits = self.tx_q.get_nowait()
-                    self.last_limit_send = 0.0                 # force a send now
-                if time.monotonic() - self.last_limit_send >= LIMIT_RESEND_S:
-                    self._send_limits()
-
-                n = self.port.in_waiting                       # bytes waiting to be read
-                if n > 0:
-                    self.buffer += self.port.read(n)
-                    *lines, self.buffer = self.buffer.split(b"\n")   # complete lines; the last piece is a partial packet kept for next time
-                    for line in lines:
-                        if PRINT_PACKETS:
-                                                    text = line.decode("ascii", errors="replace").strip()
-                                                    print(f"[{len(text)} chars] {text}")
-                        pkt = self._parse_packet(line)
-                        if pkt is None:                        # invalid packet: drop it
-                            continue
-                        seq, bpm, samples, cmd = pkt
-                        if not self._check_sequence(seq):      # duplicate / out of order: drop it
-                            continue
-                        self.last_data_time = time.monotonic() # valid packet: the link is alive
-                        self._publish(bpm, samples)
-                        if cmd in CMD_TEXT:                    # button action on the device
-                            self.rx_q.put(("event", CMD_TEXT[cmd]))
-                else:
-                    # silent failure (Bluetooth dropped, port still "open")
-                    if time.monotonic() - self.last_data_time > NO_DATA_TIMEOUT_S:
-                        self.rx_q.put(("status",
-                            f"No data for {NO_DATA_TIMEOUT_S} s - reconnecting"))
-                        self._close_port()                     # close it so the loop above reopens it
-                        self.stop_event.wait(RETRY_DELAY_S)
-                    else:
-                        self.stop_event.wait(0.01)             # short sleep so we do not use 100% CPU
-
-            # hard failure (port vanished, or a write timed out)
-            except (serial.SerialException, OSError):
-                self.rx_q.put(("status", "Connection lost - reconnecting"))
-                self._close_port()
-                self.stop_event.wait(RETRY_DELAY_S)
-
-        self._close_port()                                     # tidy up when the program exits
-
-# --------------------------------------------------------------------------
-# Display helpers
-# --------------------------------------------------------------------------
-def trim_buffers(now_t):
-    """
-    Purpose : Delete points older than each graph's time window.
-    Why     : keeps memory use and plotting time constant however long it runs.
-    """
-    for key, buf in data.items():
-        cutoff = now_t - VIEWS[key]["window_s"]
-        while buf and buf[0][0] < cutoff:
-            buf.popleft()
-
-
-def filter_button_text():
-    """Text for the filter on/off button."""
-    return "Bandpass Filter: ON" if FILTER_ON else "Bandpass Filter: OFF"
-
-
-def bandpass(values, fs):
-    """
-    Purpose : Band-pass filter the waveform between 0.5 and 4 Hz.
-    Req     : 19 (deals with low-frequency drift) and noise reduction
-    Input   : values = samples, fs = sample rate in Hz
-    Output  : filtered samples
-    Why     : 0.5 Hz removes slow baseline drift (breathing, movement); 4 Hz
-              (240 BPM) removes high-frequency noise. sosfiltfilt filters
-              forwards and backwards, so the pulse is not shifted in time.
-              This only changes the plot; the BPM comes from the ESP32.
-    """
-    nyq = fs / 2                                       # Nyquist frequency
-    if HIGH_CUT_HZ >= nyq:               # sample rate too low for this band
-        return values
-    sos = butter(FILTER_ORDER, [LOW_CUT_HZ / nyq, HIGH_CUT_HZ / nyq],
-                 btype="band", output="sos")           # Butterworth, second-order sections (numerically stable)
-    return sosfiltfilt(sos, values)
-
-
-def refresh_plot(ax, canvas, view_key, now_t):
-    """
-    Purpose : Redraw the selected graph (pulse rate or waveform).
-    Req     : 7 (BPM and waveform graphs), 19 (optional filtering)
-    Input   : view_key = "pulse" or "waveform", now_t = current time (s)
-    Why     : x is shown as "seconds before now", so the graph scrolls left.
-              The waveform view band-pass filters the data when the filter is
-              on; the threshold line is only shown when the filter is off,
-              because it belongs to the unfiltered signal.
-    """
-    view = VIEWS[view_key]
-    ax.clear()
-    ax.set_title(view["title"])
-    ax.set_xlabel(view["xlabel"])
-    ax.set_ylabel(view["ylabel"])
-    ax.set_xlim(-view["window_s"], 0)
-    ax.set_ylim(*view["ylim"])
-    ax.grid(True, linestyle="--", alpha=0.4)
-
-    rows = list(data[view_key])
-    if rows:
-        xs = [r[0] - now_t for r in rows]              # time relative to now (negative = in the past)
-        if view_key == "pulse":
-            ax.plot(xs, [r[1] for r in rows], color=view["color"])
-        else:
-            raws = [r[1] for r in rows]
-            thrs = [r[2] for r in rows]
-            filtered = False
-            if FILTER_ON and len(rows) > 50:
-                span = rows[-1][0] - rows[0][0]
-                if span > 0:
-                    fs = (len(rows) - 1) / span          # samples per second
-                    raws = bandpass(np.array(raws, dtype=float), fs)
-                    filtered = True
-            ax.plot(xs, raws, color=view["color"], label="Signal")
-            if filtered:
-                ax.set_ylabel("Filtered PPG (a.u.)")
-                lo, hi = min(raws), max(raws)
-            else:
-                ax.plot(xs, thrs, "--", color="grey", linewidth=1, label="Threshold")
-                lo, hi = min(min(raws), min(thrs)), max(max(raws), max(thrs))
-            pad = max(0.1 * (hi - lo), 1)                # 10% margin so the trace never touches the edge
-            ax.set_ylim(lo - pad, hi + pad)
-            ax.legend(loc="upper right")
-    else:
-        ax.text(0.5, 0.5, "No data yet", transform=ax.transAxes,
-                ha="center", va="center", color="grey", fontsize=14)
-    canvas.draw_idle()
-
-
-def update_bpm(window, bpm):
-    """Show the current BPM as large text with exactly 1 decimal place (Req 9, 10)."""
-    window["-BPM-"].update("--" if bpm is None else f"{bpm:.1f}")
-
-
-def get_alarm_state(bpm):
-    """
-    Purpose : Classify a BPM reading against the limits.
-    Output  : "idle" (no data), "low", "high" or "ok"
-    Why     : returning a state (not a colour) lets the same result drive the
-              alarm panel and the log.
-    """
-    if bpm is None:
-        return "idle"
-    if LOW_LIMIT is not None and bpm < LOW_LIMIT:
-        return "low"
-    if HIGH_LIMIT is not None and bpm > HIGH_LIMIT:
-        return "high"
-    if LOW_LIMIT is None and HIGH_LIMIT is None:
-        return "idle"
-    return "ok"
-
-
-def update_alarm(window, bpm):
-    """Colour and label the visual pulse alarm panel (Req 11)."""
-    s = ALARM_STYLES[get_alarm_state(bpm)]
-    window["-ALARM-"].update(s["text"], background_color=s["bg"], text_color=s["fg"])
-
-
-def update_comm_alarm(window, comm_lost):
-    """Light up (or clear) the communication-loss warning box (Req 14)."""
-    s = COMM_ALARM_STYLES["lost" if comm_lost else "ok"]
-    window["-COMM-ALARM-"].update(s["text"], background_color=s["bg"], text_color=s["fg"])
-
-# Display function updating the colour on screen
-def update_rec(window, recording):
-    s = REC_STYLES["on" if recording else "off"]
-    window["-REC-"].update(s["text"], text_color=s["fg"])
-
-def refresh_display(window, ax, canvas, view_key, bpm, now_t):
-    """Update everything the user sees: BPM number, alarm panel and graph."""
-    update_bpm(window, bpm)
-    update_alarm(window, bpm)
-    refresh_plot(ax, canvas, view_key, now_t)
-
-
-def log_event(window, message):
-    """
-    Purpose : Add one line to the system log.
-    Req     : 13 (log format "<time date stamp>: <message string>")
-    Example : Thu Sep 19 17:46:50 2024: Pulse Low
-    """
-    # Format as Day Mon DD HH:MM:SS YYYY using a 24-hour clock
-    timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
-
-    # Combine the timestamp and event message
-    log_message = f"{timestamp}: {message}"
-
-    # Append the event to the system log without overwriting old entries
-    window["-SYSTEM-LOG-"].update(
-        value=log_message + "\n",
-        append=True
-    )
-
-
-def log_alarm_transition(window, previous_state, current_state):
-    """
-    Purpose : Log pulse alarm changes, once per change.
-    Req     : 13 (events appear in the log)
-    Why     : comparing the previous and current state means a long alarm
-              produces one entry, not one entry every 0.2 s refresh.
-    """
-    # Log entry when the pulse first enters the low state
-    if current_state == "low" and previous_state != "low":
-        log_event(window, "Pulse Low")
-
-    # Log entry when the pulse first enters the high state
-    elif current_state == "high" and previous_state != "high":
-        log_event(window, "Pulse High")
-
-    # Log recovery when a low or high pulse returns to normal
-    elif current_state == "ok" and previous_state in ("low", "high"):
-        log_event(window, "Pulse Normal")
-
-    # Log when pulse data becomes unavailable after an alarm
-    elif current_state == "idle" and previous_state in ("low", "high"):
-        log_event(window, "Pulse Data Unavailable")
-
-
-def log_comm_transition(window, previous_lost, current_lost):
-    """
-    Purpose : Log when communication is lost and when it returns.
-    Req     : 14 (alarm when no packet for 5 s) and 13 (log events)
-    Why     : logs only on a change, so there is one line per outage.
-    """
-    # Log once when the 5 s timeout is first exceeded
-    if current_lost and not previous_lost:
-        log_event(window, "Data Not Received for 5 Seconds - Communication May Be Interrupted")
-    # Log once when a packet arrives again and the alarm clears
-    elif previous_lost and not current_lost:
-        log_event(window, "Data Received - Communication Restored")
-
-
-def build_layout():
-    """
-    Purpose : Define every element of the single window.
-    Req     : 6 (all information in one window), 7, 9, 11, 13, 14
-    Layout  : title + theme, view and filter buttons, graph beside the alarm
-              panel / limit sliders / big BPM, then the system log beside the
-              communication warning box.
-    """
-    idle = ALARM_STYLES["idle"]
-    bpm_panel = [
-        [sg.Text(idle["text"], key="-ALARM-", size=(18, 2), justification="center",
-                 font=("Any", 16, "bold"), background_color=idle["bg"],
-                 text_color=idle["fg"], pad=(0, (0, 10)))],
-        # User-adjustable alarm limits (Req 11): the GUI alarm and the ESP32 LED both use these values
-        [sg.Text("Low limit (BPM)")],
-        [sg.Slider(range=(MIN_VALID_BPM, MAX_VALID_BPM - 1), default_value=LOW_LIMIT,
-                   resolution=1, orientation="h", size=(20, 12),
-                   key="-LOW-LIMIT-", enable_events=True)],
-        [sg.Text("High limit (BPM)")],
-        [sg.Slider(range=(MIN_VALID_BPM + 1, MAX_VALID_BPM), default_value=HIGH_LIMIT,
-                   resolution=1, orientation="h", size=(20, 12),
-                   key="-HIGH-LIMIT-", enable_events=True, pad=(0, (0, 20)))],
-        [sg.Text("Current pulse", font=("Any", 14))],
-        [sg.Text("--", key="-BPM-", font=("Any", 72, "bold"), size=(6, 1),
-                 justification="center")],      # large text so it stands out at a glance (Req 9)
-        [sg.Text("BPM", font=("Any", 18))],
-    ]
-
-    rec = REC_STYLES["off"]
-    plot_col = [
-        [sg.Button(VIEWS["pulse"]["button_text"], key="-TOGGLE-", size=(42, 1)),
-         sg.Button(filter_button_text(), key="-FILTER-", size=(18, 1)),
-         sg.Push(),
-         sg.Text(rec["text"], key="-REC-", size=(8, 1), justification="center",
-                 font=("Any", 11, "bold"), text_color=rec["fg"],
-                 relief=sg.RELIEF_RIDGE, border_width=2, pad=(0, 5))],
-        [sg.Canvas(key="-CANVAS-")],
-    ]
-
-    # Communication-loss warning box (sits to the right of the system log)
-    comm_ok = COMM_ALARM_STYLES["ok"]
-    comm_panel = [
-        [sg.Text(comm_ok["text"], key="-COMM-ALARM-", size=(32, 6),
-                 justification="center", font=("Any", 12, "bold"),
-                 background_color=comm_ok["bg"], text_color=comm_ok["fg"])],
-    ]
-
-    return [
-        [sg.Text("Pulse Monitor", font=("Any", 20, "bold")),
-         sg.Push(),
-         sg.Text("Theme:"),
-         sg.Combo(Themes, default_value=sg.theme(), key="-THEME-",
-                  enable_events=True, readonly=True, size=(24, 1))],
-        [sg.Column(plot_col, vertical_alignment="top", pad=0),
-         sg.Column(bpm_panel, element_justification="center",
-                   vertical_alignment="center", pad=(20, 0))],
-
-        # System log heading
-        [sg.Text("System Log", font=("Any", 12, "bold"))],
-        # Read-only system log window at the bottom of the GUI
-        [sg.Multiline(
-            "",
-            key="-SYSTEM-LOG-",
-            size=(98, 12),
-            disabled=True,          # so logs are read only
-            autoscroll=True,        # keeps new entries visible
-            expand_y=False
-        ),
-         sg.Column(comm_panel, element_justification="center",
-                   vertical_alignment="top", pad=(20, 0))]
-    ]
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-def make_window(log_text=""):
-    """
-    Purpose : Build the window, the matplotlib figure and the canvas using the
-              current theme.
-    Why     : a separate function, because changing the theme means rebuilding
-              the whole window. log_text restores the old system log afterwards.
-    """
-    window = sg.Window("Pulse Monitor", build_layout(),
-                       size=(1100, 800), resizable=True, finalize=True)
-    window["-COMM-ALARM-"].Widget.config(anchor="center")
-    fig, ax = plt.subplots(figsize=(7, 4))
-    fig.tight_layout()
-    canvas = FigureCanvasTkAgg(fig, master=window["-CANVAS-"].TKCanvas)   # embed matplotlib in the window
-    canvas.get_tk_widget().pack(side="top", fill="both", expand=1)
-    if log_text:
-        window["-SYSTEM-LOG-"].update(log_text)    # restore the old log
-    return window, fig, ax, canvas
-
-
-def main():
-    """
-    Purpose : The GUI's main loop.
-    Req     : 8 (refresh at least once per second), 12 (latency under 2 s),
-              14 (5 s communication alarm), 13 (log), 11 (alarm limits)
-    Steps each pass (about every 0.1 s):
-      1. Handle user events (theme, filter, view, alarm limit sliders)
-      2. Drain the queue filled by the SerialReader thread
-      3. If 0.2 s has passed, redraw the display and check the alarms
-    Why     : redrawing is driven by a timer, not by incoming data, so the
-              display still updates (and the 5 s alarm still triggers) if the
-              data stops. Latency is about 1 s of packet batching plus at most
-              0.2 s until the next redraw, so under the 2 s limit.
-    """
-    global FILTER_ON, LOW_LIMIT, HIGH_LIMIT
-    window, fig, ax, canvas = make_window()
-
-    current_view = "pulse"                 # which graph is showing
-    rx_q = queue.Queue()                   # reader thread -> GUI (packets, status, events)
-    tx_q = queue.Queue()                   # GUI -> reader thread (alarm limits)
-    reader = SerialReader(rx_q, tx_q)
-    reader.start()                         # begin connecting in the background
-
-    latest_bpm = None                      # most recent valid BPM (None = no pulse)
-    last_data_time = None                  # time of the newest sample
-    conn_status = "Connecting..."          # last status message (so repeats are not logged)
-
-    # Store the previous alarm state to detect state changes
-    previous_alarm_state = "idle"
-
-    # Record that the GUI has started
-    log_event(window, "Pulse Monitor Started")
-
-    previous_comm_lost = False             # previous state of the 5 s communication alarm
-    recording = False
-
-    start = last_refresh = time.monotonic()
-    worst_gap, missed = 0.0, 0             # refresh-timing self-test results
-    self_test_pending = SELF_TEST
-
-    while True:
-        # ---- 1. user events ----
-        event, values = window.read(timeout=100)     # wait up to 0.1 s for a click, then carry on
-        if event == sg.WIN_CLOSED:
-            break
-
-        # ---- theme change: rebuild the window, keep everything else ----
-        if event == "-THEME-":
-            new_theme = values["-THEME-"]
-            if new_theme in Themes and new_theme != sg.theme():
-                log_text = window["-SYSTEM-LOG-"].get().rstrip("\n") + "\n"   # save the log
-                window.close()
-                plt.close(fig)
-                sg.theme(new_theme)
-                window, fig, ax, canvas = make_window(log_text)
-                window["-TOGGLE-"].update(VIEWS[current_view]["button_text"])
-                update_rec(window, recording)         # window was rebuilt, restore REC state
-                log_event(window, f"Theme changed to {new_theme}")
-                last_refresh = 0          # redraw straight away
-                continue
-
-        # Toggle bandpass filter on and off
-        if event == "-FILTER-":
-            FILTER_ON = 1 - FILTER_ON          # flips 1 -> 0 -> 1
-            window["-FILTER-"].update(filter_button_text())
-            last_refresh = 0                   # redraw immediately
-
-        # User moved an alarm-limit slider (Req 11)
-        if event in ("-LOW-LIMIT-", "-HIGH-LIMIT-"):
-            LOW_LIMIT = int(values["-LOW-LIMIT-"])
-            HIGH_LIMIT = int(values["-HIGH-LIMIT-"])
-            if LOW_LIMIT >= HIGH_LIMIT:           # keep low below high
-                if event == "-LOW-LIMIT-":
-                    LOW_LIMIT = HIGH_LIMIT - 1
-                    window["-LOW-LIMIT-"].update(LOW_LIMIT)
-                else:
-                    HIGH_LIMIT = LOW_LIMIT + 1
-                    window["-HIGH-LIMIT-"].update(HIGH_LIMIT)
-            tx_q.put((LOW_LIMIT, HIGH_LIMIT))     # two-way alarm: pass the new limits to the ESP32
-            last_refresh = 0                      # re-check the alarm straight away
-
-        # Switch between the pulse-rate graph and the waveform graph
-        if event == "-TOGGLE-":
-            current_view = "waveform" if current_view == "pulse" else "pulse"
-            window["-TOGGLE-"].update(VIEWS[current_view]["button_text"])
-            fig.tight_layout()
-            last_refresh = 0          # redraw immediately
-
-        # ---- 2. drain everything the serial thread has received ----
-        while True:
-            try:
-                item = rx_q.get_nowait()                 # never wait: take what is there and move on
-            except queue.Empty:
-                break
-            if item[0] == "status":
-                if item[1] != conn_status:            # connection messages go to the system log
-                    log_event(window, item[1])
-                conn_status = item[1]
-                continue
-            if item[0] == "event":                    # button actions from the ESP32 (cmd field)
-                log_event(window, item[1])
-                if item[1] == CMD_TEXT[1]:            # record start
-                    recording = True
-                    update_rec(window, True)
-                elif item[1] == CMD_TEXT[2]:          # record stop
-                    recording = False
-                    update_rec(window, False)
-                continue
-            _, t, raw, thr, bpm = item                # otherwise it is a waveform sample
-            last_data_time = t
-            data["waveform"].append((t, raw, thr))
-            if MIN_VALID_BPM <= bpm <= MAX_VALID_BPM:
-                latest_bpm = bpm
-                data["pulse"].append((t, bpm))
-            else:
-                latest_bpm = None     # ESP32 reports 0 when no finger/pulse
-
-        # ---- 3. timer-driven redraw: happens whether or not data arrived ----
-        now = time.monotonic()
-        if now - last_refresh >= REFRESH_INTERVAL_S:
-            gap = now - last_refresh if last_refresh else REFRESH_INTERVAL_S   # time since the last redraw
-            stale = last_data_time is None or (now - last_data_time) > STALE_AFTER_S
-            trim_buffers(now)
-
-            # Use the current valid BPM, or None when the data is stale
-            current_bpm = None if stale else latest_bpm
-
-            # Determine the current alarm state
-            current_alarm_state = get_alarm_state(current_bpm)
-
-            # Log any transition into or out of a pulse alarm state
-            log_alarm_transition(window, previous_alarm_state, current_alarm_state)
-            previous_alarm_state = current_alarm_state
-
-            # 5 s since the last packet? (Before the first packet, count from program start.)
-            reference_time = last_data_time if last_data_time is not None else start
-            comm_lost = (now - reference_time) > COMM_TIMEOUT_S
-
-            # REC STATUS: ESP32 clears its recording flag when the link drops, so do the same here
-            if comm_lost and recording:
-                recording = False
-                update_rec(window, False)
-
-            # Light up / clear the warning box
-            update_comm_alarm(window, comm_lost)
-
-            # Write to the system log only when the state changes
-            log_comm_transition(window, previous_comm_lost, comm_lost)
-            previous_comm_lost = comm_lost
-
-            # BPM, alarm and graph updates
-            refresh_display(window, ax, canvas, current_view, current_bpm, now)
-            last_refresh = now
-
-            worst_gap = max(worst_gap, gap)           # track the slowest redraw (for the self-test)
-            if gap > MAX_ALLOWED_GAP_S:
-                missed += 1
-
-        # One-off self-test: after 10 s, report whether any refresh took longer than 1 s (Req 8)
-        if self_test_pending and now - start >= SELF_TEST_DURATION_S:
-            verdict = "PASS" if worst_gap <= MAX_ALLOWED_GAP_S else "FAIL"
-            print(f"SELF-TEST {verdict}: worst gap {worst_gap:.3f} s over "
-                  f"{SELF_TEST_DURATION_S} s (limit {MAX_ALLOWED_GAP_S} s)")
-            self_test_pending = False
-
-    reader.stop_event.set()                           # ask the reader thread to stop
-    window.close()
-
-
-if __name__ == "__main__":
-    main()
+/*
+ * fftRun()
+ * ----------------------------------------------------------------------------
+ * Purpose : Fast Fourier Transform, in place, on fft_re / fft_im.
+ * Method  : iterative radix-2 (Cooley-Tukey). First the samples are put in
+ *           bit-reversed order, then log2(N) = 9 passes combine pairs of
+ *           smaller transforms ("butterflies") into bigger ones.
+ * Why     : an FFT needs about N x log2(N) operations instead of N x N, so a
+ *           512-point transform is quick enough for the ESP32 to do inside the
+ *           loop. Written out by hand, so no extra library is needed.
+ */
+void fftRun() {
+  // bit-reversal reordering
+  for (int i = 1, j = 0; i < FFT_N; i++) {
+    int bit = FFT_N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      float t = fft_re[i]; fft_re[i] = fft_re[j]; fft_re[j] = t;
+      t = fft_im[i]; fft_im[i] = fft_im[j]; fft_im[j] = t;
+    }
+  }
+  // butterfly passes: block length 2, 4, 8, ... N
+  for (int len = 2; len <= FFT_N; len <<= 1) {
+    int half = len >> 1, step = FFT_N / len;
+    for (int i = 0; i < FFT_N; i += len) {
+      for (int k = 0; k < half; k++) {
+        float wr = fft_cos[k * step], wi = fft_sin[k * step];     // twiddle factor
+        int a = i + k, b = a + half;
+        float tr = fft_re[b] * wr - fft_im[b] * wi;               // twiddle x second half
+        float ti = fft_re[b] * wi + fft_im[b] * wr;
+        fft_re[b] = fft_re[a] - tr;  fft_im[b] = fft_im[a] - ti;  // difference
+        fft_re[a] += tr;             fft_im[a] += ti;             // sum
+      }
+    }
+  }
+}
+
+/*
+ * fftMag()
+ * ----------------------------------------------------------------------------
+ * Purpose : Size (magnitude) of one frequency bin: sqrt(re^2 + im^2).
+ */
+float fftMag(int k) {
+  return sqrtf(fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]);
+}
+
+/*
+ * fftUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Estimate the heart rate from the frequency spectrum of the last 10 s.
+ * Req     : 19 (a Fourier transform as a way of calculating the pulse rate)
+ * Effect  : sets fft_bpm (0 until a full 10 s window and a valid signal exist)
+ * Steps   : 1. copy the buffer in time order and remove its mean
+ *           2. apply a Hann window (fades the edges, so the sudden start and
+ *              end of the window do not smear the spectrum)
+ *           3. run the FFT
+ *           4. find the strongest bin between 0.7 and 3.3 Hz (42-198 BPM)
+ *           5. refine the peak with a parabola through its neighbours
+ *           6. convert frequency to BPM (x 60)
+ * Why     : the pulse is the dominant repeating frequency in the signal, so
+ *           it shows up as the tallest peak. The window is 10.24 s long, so
+ *           each bin is 0.098 Hz = 5.9 BPM wide; the parabola refinement
+ *           gives a much finer estimate than the bin spacing alone. The FFT
+ *           averages over 10 s, so it reacts more slowly than the beat-by-beat
+ *           threshold method, which stays the main source of BPM.
+ */
+void fftUpdate() {
+  if (fft_seen < FFT_N || !valid_signal) { fft_bpm = 0.0f; return; }   // need a full window and a real pulse
+
+  float mean = 0.0f;
+  for (int i = 0; i < FFT_N; i++) mean += fft_ring[i];
+  mean /= FFT_N;
+
+  for (int i = 0; i < FFT_N; i++) {
+    float x = fft_ring[(fft_index + i) % FFT_N] - mean;                // oldest sample first, mean removed
+    float hann = 0.5f - 0.5f * cosf(2.0f * PI * i / (FFT_N - 1));      // Hann window
+    fft_re[i] = x * hann;
+    fft_im[i] = 0.0f;                                                  // real input, no imaginary part
+  }
+
+  fftRun();
+
+  float bin_hz = SAMPLE_RATE_HZ / FFT_N;                               // frequency step between bins
+  int k_lo = (int)ceilf(FFT_MIN_HZ / bin_hz);                          // first bin inside the heart-rate band
+  int k_hi = (int)(FFT_MAX_HZ / bin_hz);                               // last bin inside the band
+  int k_pk = k_lo;
+  float m_pk = 0.0f;
+  for (int k = k_lo; k <= k_hi; k++) {                                 // strongest bin in the band
+    float m = fftMag(k);
+    if (m > m_pk) { m_pk = m; k_pk = k; }
+  }
+
+  float a = fftMag(k_pk - 1), b = m_pk, c = fftMag(k_pk + 1);          // peak and its two neighbours
+  float denom = a - 2.0f * b + c;
+  float delta = (denom != 0.0f) ? 0.5f * (a - c) / denom : 0.0f;      // parabola vertex offset (-0.5 to +0.5 bin)
+  fft_bpm = (k_pk + delta) * bin_hz * 60.0f;                           // Hz -> beats per minute
+}
+
+/*
+ * sendPacket()
+ * ----------------------------------------------------------------------------
+ * Purpose : Build and send one fixed-length data packet to the host.
+ * Req     : 18 (packet every second: BPM, 50 raw samples, sequence number)
+ * Format  : seq,bpm,s0,...,s49,cmd\n    e.g. 00123,078.9,1930,...,1944,3
+ *             seq : 5 digits, wraps at 99999
+ *             bpm : 5 characters, one decimal place (e.g. 078.9)
+ *             s0..s49 : 50 raw ADC values, 4 digits each (0000-4095)
+ *             cmd : 1 digit, last button action (see pending_cmd)
+ *           Length is always 263 characters + newline = 264 bytes.
+ * Effect  : writes to Bluetooth (only if a host is connected), increments the
+ *           sequence number and clears the pending button command.
+ * Why     : zero-padded fields make every packet the same length (Req 18),
+ *           and plain text is easy to debug in a serial monitor. The sequence
+ *           number keeps counting even with no host, so the host can see gaps.
+ */
+void sendPacket() {
+  char line[300];                                          // big enough for 264 bytes
+  float bpm = heart_rate > 999.9f ? 999.9f : heart_rate;   // clamp so the field never exceeds 5 characters
+  int len = snprintf(line, sizeof(line), "%05lu,%05.1f", pkt_seq, bpm);   // header: seq,bpm
+  for (int i = 0; i < PKT_SAMPLES; i++)
+    len += snprintf(line + len, sizeof(line) - len, ",%04d", pkt_raw[i]); // 50 samples, 4 digits each
+  len += snprintf(line + len, sizeof(line) - len, ",%u\n", (unsigned)pending_cmd);   // command + end of packet
+
+  if (link_state == LINK_CONNECTED) SerialBT.write((const uint8_t *)line, len);      // send only if a host is connected
+  pkt_seq = (pkt_seq + 1) % 100000;      // keeps counting even with no host, so gaps are visible
+  pending_cmd = 0;                       // command has been delivered (or dropped), clear it
+}
+
+/*
+ * limitsUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Receive the alarm limits chosen on the GUI sliders (two-way alarm).
+ * Req     : 5 and 11 (the alarm follows the limits the user sets on the host)
+ * Message : "LIM,low,high\n"   e.g. LIM,055,120
+ *           The GUI sends it whenever a slider moves, after every (re)connect
+ *           and every 5 s as a refresh.
+ * Effect  : updates low_bpm_limit and high_bpm_limit if the message is valid.
+ * Why     : the ESP32 keeps its own copy of the limits and compares its own
+ *           BPM to them, so the alarm LED still works if Bluetooth drops. The
+ *           5 s refresh means a lost message, or an ESP32 reboot, corrects
+ *           itself. Invalid values (outside 20-250, or low >= high) are
+ *           ignored. Characters are read one at a time without waiting, so the
+ *           20 ms sampling is never delayed.
+ */
+void limitsUpdate() {
+  static char buf[24];                                     // one incoming line
+  static uint8_t len = 0;
+
+  while (SerialBT.available() > 0) {                       // only reads what has already arrived
+    char c = SerialBT.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {                                       // end of line: try to decode it
+      buf[len] = '\0';
+      int lo, hi;
+      if (sscanf(buf, "LIM,%d,%d", &lo, &hi) == 2 &&
+          lo >= LIMIT_MIN_BPM && hi <= LIMIT_MAX_BPM && lo < hi) {
+        low_bpm_limit = lo;
+        high_bpm_limit = hi;
+      }
+      len = 0;
+    }
+    else if (len < sizeof(buf) - 1) buf[len++] = c;        // build up the line
+    else len = 0;                                          // discard an overlong line
+  }
+}
+
+/*
+ * connectionUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Work out the Bluetooth link state and drive the status LED.
+ * Req     : 15 / 17 (Bluetooth link, connect quickly), 5 (LED behaviour)
+ * Effect  : sets link_state, clears recording when not connected, writes LED 1.
+ * LED 1   : off          = host connection disabled by the user
+ *           slow blink   = waiting for the host
+ *           double-blink = connected, not recording
+ *           solid        = connected and recording
+ * Why     : the state comes straight from SerialBT.hasClient(), so the LED
+ *           always shows the real link and not what we hope is happening.
+ */
+void connectionUpdate() {
+  if (!bt_enabled && SerialBT.hasClient()) SerialBT.disconnect();   // user chose to disconnect
+
+  if (!bt_enabled)               link_state = LINK_OFF;
+  else if (SerialBT.hasClient()) link_state = LINK_CONNECTED;
+  else                           link_state = LINK_SEARCHING;
+
+  if (link_state != LINK_CONNECTED) recording = false;     // cannot record without a host
+
+  bool slow_blink = ((ticks / 25) % 2) != 0;               // toggles every 25 ticks = 500 ms
+  uint8_t p = ticks % 50;                                  // position in a 1 s cycle (50 ticks)
+  bool dbl = (p < 5) || (p >= 10 && p < 15);               // two 100 ms flashes per second
+
+  bool led_on = false;
+  if (link_state == LINK_SEARCHING) led_on = slow_blink;
+  else if (link_state == LINK_CONNECTED) led_on = recording ? true : dbl;
+  digitalWrite(LED_STATUS_PIN, led_on ? HIGH : LOW);
+}
+
+/*
+ * buttonUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Turn the debounced button state into single / double / hold gestures.
+ * Req     : 5 (button behaviour; the command also goes to the host, Req 18)
+ * Input   : now = current time in ms
+ * Gestures: single click = silence an active alarm, otherwise start/stop recording
+ *           double click = event marker
+ *           hold 2 s     = turn the host connection off / on
+ * Effect  : sets pending_cmd (sent in the next packet), alarm_silenced,
+ *           recording and bt_enabled.
+ * Why     : it is a small state machine that runs every 20 ms and never blocks.
+ *           A single click is only confirmed 500 ms after release, because
+ *           until then a second press could still turn it into a double click.
+ */
+void buttonUpdate(unsigned long now) {
+  bool pressed = button.state();                           // debounced state (true = pressed)
+
+  if (pressed && !button_prev) {                           // press
+    pressed_at = now;
+    hold_handled = false;
+    if (pending_click && now - released_at <= DOUBLE_MS) { // 2nd press arrived in time
+      second_press = true;
+      pending_click = false;
+    }
+  }
+
+  if (pressed && !hold_handled && now - pressed_at >= HOLD_MS) {   // hold
+    hold_handled = true;                                   // stops the release being read as a click
+    pending_click = false;
+    second_press = false;
+    bt_enabled = !bt_enabled;
+  }
+
+  if (!pressed && button_prev && !hold_handled) {          // release
+    if (second_press) {
+      second_press = false;                                // double click
+      pending_cmd = 3;
+    } else {
+      pending_click = true;                                // maybe a single click: wait for a 2nd press
+      released_at = now;
+    }
+  }
+
+  if (pending_click && !pressed && now - released_at >= DOUBLE_MS) {   // single click
+    pending_click = false;
+    if (alarm_state != ALARM_NONE && !alarm_silenced) {    // alarm active: silence it
+      alarm_silenced = true;
+      pending_cmd = 4;
+    } else if (link_state == LINK_CONNECTED) {             // otherwise toggle recording (needs a host)
+      recording = !recording;
+      pending_cmd = recording ? 1 : 2;
+    }
+  }
+
+  button_prev = pressed;                                   // remember for edge detection next tick
+}
+
+/*
+ * alarmLedUpdate()
+ * ----------------------------------------------------------------------------
+ * Purpose : Drive the heart-rate alarm LED.
+ * Req     : 5 (LED behaviour)
+ * Effect  : writes LED 2 and re-arms the alarm when BPM is back in range.
+ * LED 2   : fast flash (5 Hz) = high heart rate
+ *           slow flash (1 Hz) = low heart rate
+ *           off               = normal, or alarm silenced
+ * Why     : a silenced alarm stays silent until BPM returns to normal, so a
+ *           new excursion triggers a fresh alarm instead of staying muted.
+ */
+void alarmLedUpdate() {
+  bool slow_blink = ((ticks / 25) % 2) != 0;               // 500 ms on / 500 ms off
+  bool fast_blink = ((ticks / 5) % 2) != 0;                // 100 ms on / 100 ms off
+
+  if (alarm_state == ALARM_NONE) alarm_silenced = false;   // re-arms when BPM is normal
+
+  bool led_on = false;
+  if (!alarm_silenced) {
+    if (alarm_state == ALARM_HIGH) led_on = fast_blink;
+    else if (alarm_state == ALARM_LOW) led_on = slow_blink;
+  }
+  digitalWrite(LED_ALARM_PIN, led_on ? HIGH : LOW);
+}
+
+/*
+ * setup()
+ * ----------------------------------------------------------------------------
+ * Purpose : One-time start-up: configure pins, USB serial, FFT tables and Bluetooth.
+ * Req     : 15 (Bluetooth SPP started once, so the board is discoverable
+ *           from power-up, which helps Req 17).
+ */
+void setup() {
+  pinMode(SENSOR_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(LED_STATUS_PIN, OUTPUT);
+  pinMode(LED_ALARM_PIN, OUTPUT);
+  digitalWrite(LED_STATUS_PIN, LOW);                       // both LEDs start off
+  digitalWrite(LED_ALARM_PIN, LOW);
+  Serial.begin(115200);                                    // USB serial for the Serial Plotter (Req 4)
+  fftInit();                                               // precalculate the FFT's sine / cosine table
+  if (!SerialBT.begin(BT_NAME)) Serial.println("Bluetooth init failed");   // REQ 15, called once only
+  lastTickTime = micros();                                 // start the 20 ms scheduler
+}
+
+/*
+ * loop()
+ * ----------------------------------------------------------------------------
+ * Purpose : The whole real-time pipeline, run once every 20 ms.
+ * Req     : 1 (20 ms schedule), 2, 4, 5, 18, 19
+ * Why     : loop() runs continuously but only does work when 20 ms have
+ *           passed. No delay() is used, so nothing blocks the sampling.
+ *
+ * Steps each tick:
+ *   1. Schedule      wait until 20 ms have passed
+ *   2. Inputs        read and debounce the button, update connection state,
+ *                    receive any new alarm limits from the GUI
+ *   3. Sample        read the PPG sensor, store it for the packet
+ *   4. Filter        low-pass + baseline removal (Req 19)
+ *   5. Threshold     adaptive threshold from the last 2 s (Req 19)
+ *   6. Beat detect   hysteresis crossing -> registerBeat() (Req 2),
+ *                    and once per second the FFT estimate (Req 19)
+ *   7. Alarm         BPM vs the GUI's limits -> alarm state -> alarm LED (Req 5)
+ *   8. Output        Serial Plotter line (Req 4)
+ */
+void loop() {
+  // ---- 1. Schedule ----
+  if ((unsigned long)(micros() - lastTickTime) < TICK_20MSEC) return;   // not time yet (unsigned maths survives micros() overflow)
+  lastTickTime += TICK_20MSEC;     // REQ 1: fixed 20 ms schedule (advance by exactly 20 ms, so no drift)
+  ticks++;
+
+  unsigned long now = millis();    // timestamp used by the button and beat logic
+
+  // ---- 2. Inputs ----
+  // REQ 1 + 3: button sampled every 20 ms and debounced
+  button.update(digitalRead(BUTTON_PIN));
+  buttonUpdate(now);
+  connectionUpdate();
+  limitsUpdate();                  // two-way alarm: pick up new limits from the GUI
+
+  // ---- 3. Sample ----
+  // REQ 1: sensor sampled every 20 ms
+  uint16_t raw = analogRead(SENSOR_PIN);                   // 12-bit reading, 0-4095
+
+  // REQ 18: collect 50 raw samples, then send one packet per second
+  pkt_raw[pkt_count++] = raw;
+  if (pkt_count >= PKT_SAMPLES) { pkt_count = 0; sendPacket(); }   // 50 x 20 ms = exactly 1 s
+
+  // ---- 4. Filter ----
+  // REQ 19: low-pass removes noise, slow baseline removes drift
+  if (!filters_ready) { smooth = raw; baseline = raw; filters_ready = true; }   // start from the first reading
+  smooth   += 0.4f  * (raw - smooth);                      // moving average: low-pass, roughly 4 Hz cutoff
+  baseline += 0.01f * (smooth - baseline);                 // very slow average (about 2 s): follows drift
+  int sensor_reading = (int)(smooth - baseline);           // pulse signal centred on 0
+
+  // rolling sample window (the last 2 s of filtered samples)
+  samples[sample_index] = sensor_reading;
+  sample_index = (sample_index + 1) % WINDOW_TICKS;
+  if (samples_seen < WINDOW_TICKS) samples_seen++;
+
+  // FFT buffer (the last 10 s of filtered samples)
+  fft_ring[fft_index] = (float)sensor_reading;
+  fft_index = (fft_index + 1) % FFT_N;
+  if (fft_seen < FFT_N) fft_seen++;
+
+  // ---- 5. Adaptive threshold ----
+  // REQ 19: adaptive threshold, updated every 100 ms once the window is full
+  if (samples_seen == WINDOW_TICKS && ticks % THRESHOLD_UPDATE == 0) {
+    int16_t win_min = 32767, win_max = -32768;
+    for (uint16_t i = 0; i < WINDOW_TICKS; i++) {          // find the lowest and highest sample in the window
+      if (samples[i] < win_min) win_min = samples[i];
+      if (samples[i] > win_max) win_max = samples[i];
+    }
+    int amplitude = win_max - win_min;                     // peak-to-trough size of the pulse
+    valid_signal = (amplitude >= MIN_AMPLITUDE);           // too small = no finger on the sensor
+    if (valid_signal) {
+      threshold       = win_min + (int)(0.60f * amplitude);   // detect level: 60% up the pulse
+      reset_threshold = win_min + (int)(0.40f * amplitude);   // re-arm level: 40% up the pulse
+    }
+  }
+
+  // ---- 6. Beat detection ----
+  // REQ 2: beat detection with hysteresis (two levels stop one noisy edge counting twice)
+  if (valid_signal && sensor_reading < reset_threshold) beat_armed = true;         // signal fell low: ready for the next beat
+  if (valid_signal && beat_armed && sensor_reading > threshold) {                  // rising edge through the upper level
+    beat_armed = false;
+    registerBeat(now);
+  }
+
+  // expire BPM if no new beat has arrived
+  if (last_beat_time != 0 && now - last_beat_time >= BEAT_TIMEOUT_MS) {
+    heart_rate = 0.0f;
+    last_beat_time = 0;
+    clearIntervals();
+  }
+
+  // REQ 19: FFT-based heart rate, once per second
+  if (ticks % FFT_UPDATE == 0) fftUpdate();
+
+  // ---- 7. Alarm ----
+  // REQ 5: alarm state from BPM, using the limits set on the GUI sliders
+  if (heart_rate <= 0.0f)                    alarm_state = ALARM_NONE;    // no reading = no alarm
+  else if (heart_rate > high_bpm_limit)      alarm_state = ALARM_HIGH;
+  else if (heart_rate < low_bpm_limit)       alarm_state = ALARM_LOW;
+  else                                       alarm_state = ALARM_NONE;
+
+  alarmLedUpdate();
+
+  // ---- 8. Output ----
+  // REQ 4: waveform + threshold + both BPM estimates over USB for the Arduino Serial Plotter
+  Serial.printf("Raw:%d Threshold:%d HeartRate:%.1f FFT_BPM:%.1f\n",
+                sensor_reading, threshold, heart_rate, fft_bpm);
+}
