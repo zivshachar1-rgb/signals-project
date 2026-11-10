@@ -49,8 +49,8 @@ REQUIREMENT MAP
     Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
     Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
     Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
-    Extra   Researcher tab ........................ draw_research() (research.py)
-    Extra   Summary report on exit ................ Recorder, make_report() (research.py)
+    Extra   Researcher tab ........................ draw_research() (research.py) ----- ENGINEER RESPONSIBLE: ZIV
+    Extra   Summary report on exit ................ Recorder, make_report() (research.py) ----- ENGINEER RESPONSIBLE: ZIV
 
     pip install PySimpleGUI matplotlib pyserial numpy scipy
 (Install "pyserial", not "serial" - they are different packages.)
