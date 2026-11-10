@@ -17,23 +17,23 @@
  *    filtered signal -> 10 s buffer -> FFT once per second -> FFT BPM (USB only)
  *
  *  REQUIREMENT MAP
- *    Req 1   20 ms sampling of sensor and button ..... loop() scheduler
- *    Req 2   BPM calculated on the microcontroller ... registerBeat(), loop()
- *    Req 3   debounce count of 5 ..................... Switch class, DEBOUNCE_CNT
- *    Req 4   waveform + threshold for Serial Plotter . last line of loop()
- *    Req 5   LED and button behaviour ................ buttonUpdate(),
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 1   20 ms sampling of sensor and button ..... loop() scheduler
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 2   BPM calculated on the microcontroller ... registerBeat(), loop()
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 3   debounce count of 5 ..................... Switch class, DEBOUNCE_CNT
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 4   waveform + threshold for Serial Plotter . last line of loop()
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 5   LED and button behaviour ................ buttonUpdate(),
  *                                                      connectionUpdate(),
  *                                                      alarmLedUpdate(),
  *                                                      limitsUpdate()
- *    Req 15  Bluetooth SPP ........................... SerialBT, setup()
- *    Req 16  reconnect ............................... ESP32 keeps advertising
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 15  Bluetooth SPP ........................... SerialBT, setup()
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 16  reconnect ............................... ESP32 keeps advertising
  *                                                      after a drop; the host retries
- *    Req 17  connect within 10 s ..................... advertising from power-up
- *    Req 18  fixed-length packet every second ........ sendPacket()
- *    Req 19  low-frequency drift ..................... baseline removal and
- *                                                      adaptive threshold in loop(),
- *                                                      plus an FFT pulse-rate estimate
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 17  connect within 10 s ..................... advertising from power-up
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 18  fixed-length packet every second ........ sendPacket()
+ *   ENGINEER RESPONSIBLE: ZIV --- Req 19  low-frequency drift ..................... baseline removal and adaptive threshold in loop(), plus an FFT pulse-rate estimate
  *                                                      in fftUpdate()
+ *                                                      
+ *                                                     
  * ============================================================================
  */
 
