@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  ESP32 WEARABLE PPG PULSE MONITOR  -  final sketch
+ *  ESP32 WEARABLE PPG PULSE MONITOR
  * ============================================================================
  *  WHAT IT DOES
  *    Samples a pulse (PPG) sensor every 20 ms, detects heartbeats, calculates
@@ -17,30 +17,30 @@
  *    filtered signal -> 10 s buffer -> FFT once per second -> FFT BPM (USB only)
  *
  *  REQUIREMENT MAP
- *   ENGINEER RESPONSIBLE: ZIV --- Req 1   20 ms sampling of sensor and button ..... loop() scheduler
- *   ENGINEER RESPONSIBLE: ZIV --- Req 2   BPM calculated on the microcontroller ... registerBeat(), loop()
- *   ENGINEER RESPONSIBLE: ZIV --- Req 3   debounce count of 5 ..................... Switch class, DEBOUNCE_CNT
- *   ENGINEER RESPONSIBLE: ZIV --- Req 4   waveform + threshold for Serial Plotter . last line of loop()
- *   ENGINEER RESPONSIBLE: ZIV --- Req 5   LED and button behaviour ................ buttonUpdate(),
+ *    Req 1   20 ms sampling of sensor and button ..... loop() scheduler
+ *    Req 2   BPM calculated on the microcontroller ... registerBeat(), loop()
+ *    Req 3   debounce count of 5 ..................... Switch class, DEBOUNCE_CNT
+ *    Req 4   waveform + threshold for Serial Plotter . last line of loop()
+ *    Req 5   LED and button behaviour ................ buttonUpdate(),
  *                                                      connectionUpdate(),
  *                                                      alarmLedUpdate(),
  *                                                      limitsUpdate()
- *   ENGINEER RESPONSIBLE: ZIV --- Req 15  Bluetooth SPP ........................... SerialBT, setup()
- *   ENGINEER RESPONSIBLE: ZIV --- Req 16  reconnect ............................... ESP32 keeps advertising
+ *    Req 15  Bluetooth SPP ........................... SerialBT, setup()
+ *    Req 16  reconnect ............................... ESP32 keeps advertising
  *                                                      after a drop; the host retries
- *   ENGINEER RESPONSIBLE: ZIV --- Req 17  connect within 10 s ..................... advertising from power-up
- *   ENGINEER RESPONSIBLE: ZIV --- Req 18  fixed-length packet every second ........ sendPacket()
- *   ENGINEER RESPONSIBLE: ZIV --- Req 19  low-frequency drift ..................... baseline removal and adaptive threshold in loop(), plus an FFT pulse-rate estimate
+ *    Req 17  connect within 10 s ..................... advertising from power-up
+ *    Req 18  fixed-length packet every second ........ sendPacket()
+ *    Req 19  low-frequency drift ..................... baseline removal and
+ *                                                      adaptive threshold in loop(),
+ *                                                      plus an FFT pulse-rate estimate
  *                                                      in fftUpdate()
- *                                                      
- *                                                     
  * ============================================================================
  */
 
 #include "switch.h"            // Switch class: debounces the button (Req 3)
 #include "BluetoothSerial.h"   // classic Bluetooth serial port, SPP (Req 15)
 
-// Stop compilation early if the board package has Bluetooth switched off
+// Req 15 - Stop compilation early if the board package has Bluetooth switched off
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled!
 #endif
@@ -83,7 +83,7 @@
 #define DOUBLE_MS        500UL     // second press within this time = "double click"
 
 // ---- Bluetooth and packet (REQ 15, 18) ----
-#define BT_NAME          "ESP32AK"   // name the host pairs with
+#define BT_NAME          "ESP32AK"   // name the host computer pairs with
 #define PKT_SAMPLES      50          // 50 x 20 ms = 1 s of data per packet
 
 enum AlarmState { ALARM_NONE, ALARM_HIGH, ALARM_LOW };
@@ -522,7 +522,7 @@ void setup() {
   digitalWrite(LED_ALARM_PIN, LOW);
   Serial.begin(115200);                                    // USB serial for the Serial Plotter (Req 4)
   fftInit();                                               // precalculate the FFT's sine / cosine table
-  if (!SerialBT.begin(BT_NAME)) Serial.println("Bluetooth init failed");   // REQ 15, called once only
+  if (!SerialBT.begin(BT_NAME)) Serial.println("Bluetooth init failed");   // REQ 15 (called once) ESP32 is the SPP server, starts the SPP server and makes the board discoverable
   lastTickTime = micros();                                 // start the 20 ms scheduler
 }
 

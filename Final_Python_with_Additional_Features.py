@@ -49,8 +49,8 @@ REQUIREMENT MAP
     Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
     Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
     Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
-    ENGINEER RESPONSIBLE: ZIV --- Extra   Researcher tab ........................ draw_research() (research.py)
-    ENGINEER RESPONSIBLE: ZIV --- Extra   Summary report on exit ................ Recorder, make_report() (research.py)
+    Extra   Researcher tab ........................ draw_research() (research.py)
+    Extra   Summary report on exit ................ Recorder, make_report() (research.py)
 
     pip install PySimpleGUI matplotlib pyserial numpy scipy
 (Install "pyserial", not "serial" - they are different packages.)
@@ -80,7 +80,7 @@ PORT_NAME = "COM3"         # Windows: the OUTGOING Bluetooth COM port of the pai
 BAUD_RATE = 115200         # ignored by Bluetooth SPP, kept for pyserial
 SERIAL_TIMEOUT_S = 2
 
-LOW_LIMIT = 40     # alarm limits (changed live by the sliders, and sent to the ESP32)
+LOW_LIMIT = 40             # alarm limits (changed live by the sliders, and sent to the ESP32)
 HIGH_LIMIT = 120
 LIMIT_RESEND_S = 5         # limits are re-sent this often, so a lost message or an ESP32 reboot heals itself
 
@@ -100,6 +100,8 @@ PRINT_PACKETS = True      # print every received packet to the terminal
 SAMPLES_PER_PACKET = 50    # 1 s / 20 ms
 SAMPLE_PERIOD_S = 0.020    # time between samples inside a packet
 PKT_CHARS = 263            # fixed packet length, excluding the newline
+# 50x(5 spaces =  ADC converter BPM 4 char + 1 space) 
+# commas, commands and new lines = 263
 CMD_TEXT = {1: "Recording started", 2: "Recording stopped",
             3: "Event marker", 4: "Alarm silenced on device"}   # cmd code -> log message
 
@@ -150,7 +152,7 @@ ALARM_STYLES = {
     "high": {"text": "PULSE TOO HIGH", "bg": "#E53935", "fg": "#FFFFFF"},
 }
 
-# Colours and text for the communication-loss box (Req 14)
+# Req 14: Colours and text for the communication-loss box (Req 14)
 COMM_ALARM_STYLES = {
     "ok":   {"text": "COMMUNICATION OK\nData packets arriving.",
              "bg": "#BDBDBD", "fg": "#222222"},
@@ -160,7 +162,7 @@ COMM_ALARM_STYLES = {
 }
 
 REC_STYLES = {
-    "off": {"text": "\u25CF  REC", "fg": "#9E9E9E"},   # grey, \u25CF is filled circle
+    "off": {"text": "\u25CF  REC", "fg": "#9E9E9E"},   # \u25CF is filled circle,fg = forground colour, 9E9E9E = grey, dict 
     "on":  {"text": "\u25CF  REC", "fg": "#E53935"},   # red
 }
 
@@ -201,6 +203,7 @@ class SerialReader(threading.Thread):
         self.limits = (LOW_LIMIT, HIGH_LIMIT)          # latest alarm limits to send to the ESP32
         self.last_limit_send = 0.0                     # when the limits were last sent
 
+    #   REQUIREMENT 15
     def _open_port(self):
         """Try to open the Bluetooth COM port. Returns the port, or None on failure."""
         p = serial.Serial()
@@ -294,13 +297,14 @@ class SerialReader(threading.Thread):
             t = t_end - (n - 1 - i) * SAMPLE_PERIOD_S    # spread over the last second
             self.rx_q.put(("data", t, v, thr, bpm))
 
+    # Requirement 16 - Continually Try to reconnect
     def run(self):
         """
         Thread main loop: connect -> send limits + read packets -> detect
         failure -> reconnect. The loop never exits until the program closes,
         which is how the host "continuously tries to reconnect" (Req 16).
         """
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set(): # continually tries until GUI closes
 
             # no open port -> keep trying forever (Req 16, 17)
             if self.port is None or not self.port.is_open:
@@ -372,7 +376,7 @@ class SerialReader(threading.Thread):
                 self.stop_event.wait(RETRY_DELAY_S)
 
         self._close_port()                                     # tidy up when the program exits
-
+ 
 # --------------------------------------------------------------------------
 # Display helpers
 # --------------------------------------------------------------------------
@@ -489,7 +493,7 @@ def update_alarm(window, bpm):
     s = ALARM_STYLES[get_alarm_state(bpm)]
     window["-ALARM-"].update(s["text"], background_color=s["bg"], text_color=s["fg"])
 
-
+# Req 14 - switches alarm colours
 def update_comm_alarm(window, comm_lost):
     """Light up (or clear) the communication-loss warning box (Req 14)."""
     s = COMM_ALARM_STYLES["lost" if comm_lost else "ok"]
@@ -508,15 +512,23 @@ def refresh_display(window, ax, canvas, view_key, bpm, now_t):
     update_alarm(window, bpm)
     refresh_plot(ax, canvas, view_key, now_t)
 
-
+# REQUIREMENT 13
 def log_event(window, message):
     """
     Purpose : Add one line to the system log.
-    Req     : 13 (log format "<time date stamp>: <message string>")
+    Req     : Req 13 (log format "<time date stamp>: <message string>")
     Example : Thu Sep 19 17:46:50 2024: Pulse Low
     """
     # Format as Day Mon DD HH:MM:SS YYYY using a 24-hour clock
-    timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y") 
+    
+    # %a = weekday name abbrev
+    # %b = month name abbrev
+    # %d = day of the month zero-padded 
+    # %H = Hour on a 24-hour clock as a zero-padded number (00 to 23)
+    # %M = Minute as a zero-padded number (00 to 59).
+    # %S = Second as a zero-padded number (00 to 59).
+    # %Y = Full four-digit year (e.g., 2026)
 
     # Combine the timestamp and event message
     log_message = f"{timestamp}: {message}"
@@ -828,9 +840,9 @@ def main():
             log_alarm_transition(window, previous_alarm_state, current_alarm_state)
             previous_alarm_state = current_alarm_state
 
-            # 5 s since the last packet? (Before the first packet, count from program start.)
+            # Req 14 - 5 s since the last packet? (Before the first packet, count from program start.)
             reference_time = last_data_time if last_data_time is not None else start
-            comm_lost = (now - reference_time) > COMM_TIMEOUT_S
+            comm_lost = (now - reference_time) > COMM_TIMEOUT_S # comm_lost is true when exceeds 5s
 
             # REC STATUS: ESP32 clears its recording flag when the link drops, so do the same here
             if comm_lost and recording:

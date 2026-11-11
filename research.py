@@ -20,6 +20,10 @@ BEAT_WIN = (int(0.3 * FS), int(0.5 * FS))     # samples before / after a peak = 
 
 
 # ---------------------------------------------------------------- signal processing
+## Zero-phase Butterworth band-pass: keeps frequencies between lo and hi (Hz), removes the rest.
+## # USED BY:
+    #   detect_beats() calls it with 0.5-4 Hz  -> feeds graphs (a), (b), (c)
+    #   resp_rate()    calls it with 0.1-0.5 Hz -> feeds graph (d)
 def bandpass(x, lo, hi, order=2):
     sos = butter(order, [lo / (FS / 2), hi / (FS / 2)], btype="band", output="sos")
     return sosfiltfilt(sos, x)
@@ -33,13 +37,19 @@ def detect_beats(raw):
 
 
 def intervals(peaks):
-    """Beat-to-beat intervals in ms, keeping only physiological ones (30-200 BPM)."""
+    """Beat-to-beat intervals in ms, keeping only physiological ones (30-200 BPM) for (b)."""
     ibi = np.diff(peaks) / FS * 1000
     return ibi[(ibi > 300) & (ibi < 2000)]
 
 
 def hrv(ibi):
     """Time-domain HRV: mean HR, SDNN, RMSSD, pNN50."""
+    # mean heart rate (60000 ms / mean gap)
+    # SDNN: overall spread of the gaps (ms), 
+    # RMSSD: typical beat-to-beat change (ms), 
+    # pNN50: % of neighbouring gaps differing by >50 ms (REPORT only; not shown live)
+
+
     d = np.diff(ibi)
     return {"hr": 60000 / ibi.mean(), "sdnn": ibi.std(ddof=1),
             "rmssd": np.sqrt(np.mean(d ** 2)), "pnn50": 100 * np.mean(np.abs(d) > 50)}
