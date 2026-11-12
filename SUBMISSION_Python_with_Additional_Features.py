@@ -33,24 +33,24 @@ MESSAGE TO THE ESP32 (alarm limits)
       sent when a slider moves, after every (re)connect and every 5 s
 
 REQUIREMENT MAP
-    Req 6   one window ............................ build_layout(), make_window()
-    Req 7   BPM and waveform graphs ............... VIEWS, refresh_plot(), toggle button
-    Req 8   refresh at least once per second ...... timer-driven redraw in main()
-    Req 9   large BPM text ........................ the -BPM- element (72 pt)
-    Req 10  BPM to 1 decimal place ................ update_bpm()
-    Req 11  visual alarm for high / low pulse ..... update_alarm(); sliders set the
+    ENGINEER RESPONISBLE: ALYSSA AND SIMON -- Req 6   one window ............................ build_layout(), make_window()
+    ENGINEER RESPONISBLE: SIMON -- Req 7   BPM and waveform graphs ............... VIEWS, refresh_plot(), toggle button
+    ENGINEER RESPONISBLE: SIMON -- Req 8   refresh at least once per second ...... timer-driven redraw in main()
+    ENGINEER RESPONISBLE: SIMON -- Req 9   large BPM text ........................ the -BPM- element (72 pt)
+    ENGINEER RESPONISBLE: SIMON -- Req 10  BPM to 1 decimal place ................ update_bpm()
+    ENGINEER RESPONISBLE: SIMON -- Req 11  visual alarm for high / low pulse ..... update_alarm(); sliders set the
                                                     limits and _send_limits() passes
                                                     them to the ESP32
-    Req 12  display latency under 2 s ............. 1 s packets + 0.2 s redraw
-    Req 13  system log with timestamp format ...... log_event()
-    Req 14  alarm if no packet for 5 s ............ update_comm_alarm(), log_comm_transition()
-    Req 15  Bluetooth SPP ......................... SerialReader
-    Req 16  automatic reconnect ................... SerialReader.run()
-    Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
-    Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
-    Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
-    Extra   Researcher tab ........................ draw_research() (research.py)
-    Extra   Summary report on exit ................ Recorder, make_report() (research.py)
+    ENGINEER RESPONISBLE: SIMON -- Req 12  display latency under 2 s ............. 1 s packets + 0.2 s redraw
+    ENGINEER RESPONISBLE: ALYSSA -- Req 13  system log with timestamp format ...... log_event()
+    ENGINEER RESPONISBLE: ALYSSA -- Req 14  alarm if no packet for 5 s ............ update_comm_alarm(), log_comm_transition()
+    ENGINEER RESPONISBLE: ALYSSA -- Req 15  Bluetooth SPP ......................... SerialReader
+    ENGINEER RESPONISBLE: ALYSSA -- Req 16  automatic reconnect ................... SerialReader.run()
+    ENGINEER RESPONISBLE: ALYSSA -- Req 17  connected within 10 s ................. SerialReader.run() ("Connected in X s")
+    ENGINEER RESPONISBLE: SIMON -- Req 18  packet check and sequence numbers ..... _parse_packet(), _check_sequence()
+    ENGINEER RESPONISBLE: SIMON -- Req 19  low-frequency / noise handling ........ bandpass() on the waveform view
+    ENGINEER RESPONISBLE: ZIV -- Extra   Researcher tab ........................ draw_research() (research.py)
+    ENGINEER RESPONISBLE: ZIV -- Extra   Summary report on exit ................ Recorder, make_report() (research.py)
 
     pip install PySimpleGUI matplotlib pyserial numpy scipy
 (Install "pyserial", not "serial" - they are different packages.)
